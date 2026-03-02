@@ -4,9 +4,9 @@ import (
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-gonic/gin"
-	"github.com/hedwi/certhub/config"
-	"github.com/hedwi/certhub/controllers"
-	"github.com/hedwi/certhub/middleware"
+	"github.com/hedwi/certhub-server/config"
+	"github.com/hedwi/certhub-server/controllers"
+	"github.com/hedwi/certhub-server/middleware"
 )
 
 func SetupRouter() *gin.Engine {

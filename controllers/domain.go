@@ -4,9 +4,9 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	"github.com/hedwi/certhub/config"
-	"github.com/hedwi/certhub/models"
-	"github.com/hedwi/certhub/utils"
+	"github.com/hedwi/certhub-server/config"
+	"github.com/hedwi/certhub-server/models"
+	"github.com/hedwi/certhub-server/utils"
 )
 
 type DomainInput struct {

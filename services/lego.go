@@ -12,7 +12,7 @@ import (
 	"github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/providers/dns/cloudflare"
 	"github.com/go-acme/lego/v4/registration"
-	"github.com/hedwi/certhub/config"
+	"github.com/hedwi/certhub-server/config"
 )
 
 type MyUser struct {

@@ -1,4 +1,4 @@
-module github.com/hedwi/certhub
+module github.com/hedwi/certhub-server
 
 go 1.25.6
 

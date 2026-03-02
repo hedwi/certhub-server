@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/hedwi/certhub/models"
+	"github.com/hedwi/certhub-server/models"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )

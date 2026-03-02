@@ -3,8 +3,8 @@ package main
 import (
 	"log"
 
-	"github.com/hedwi/certhub/config"
-	"github.com/hedwi/certhub/routes"
+	"github.com/hedwi/certhub-server/config"
+	"github.com/hedwi/certhub-server/routes"
 )
 
 func main() {
