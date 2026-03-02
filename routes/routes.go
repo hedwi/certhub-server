@@ -1,13 +1,27 @@
 package routes
 
 import (
+	"github.com/gin-contrib/sessions"
+	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-gonic/gin"
+	"github.com/hedwi/certhub/config"
 	"github.com/hedwi/certhub/controllers"
 	"github.com/hedwi/certhub/middleware"
 )
 
 func SetupRouter() *gin.Engine {
 	r := gin.Default()
+
+	// Configure session middleware from config
+	s := config.Cfg.Session
+	store := cookie.NewStore([]byte(s.Secret))
+	store.Options(sessions.Options{
+		MaxAge:   s.MaxAge,
+		Path:     s.Path,
+		HttpOnly: s.HttpOnly,
+		Secure:   s.Secure,
+	})
+	r.Use(sessions.Sessions(s.Name, store))
 
 	// CORS middleware could be added here
 
@@ -17,6 +31,7 @@ func SetupRouter() *gin.Engine {
 		{
 			auth.POST("/register", controllers.Register)
 			auth.POST("/login", controllers.Login)
+			auth.POST("/logout", controllers.Logout)
 		}
 
 		protected := api.Group("/")

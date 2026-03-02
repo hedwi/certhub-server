@@ -3,6 +3,7 @@ package controllers
 import (
 	"net/http"
 
+	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
 	"github.com/hedwi/certhub/config"
 	"github.com/hedwi/certhub/models"
@@ -44,11 +45,13 @@ func Register(c *gin.Context) {
 		return
 	}
 
-	token, _ := utils.GenerateToken(user.ID)
+	// Set session
+	session := sessions.Default(c)
+	session.Set("user_id", user.ID)
+	session.Save()
 
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "User registered successfully",
-		"token":   token,
 		"user":    user,
 	})
 }
@@ -76,20 +79,33 @@ func Login(c *gin.Context) {
 		return
 	}
 
-	token, err := utils.GenerateToken(user.ID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+	// Set session
+	session := sessions.Default(c)
+	session.Set("user_id", user.ID)
+	if err := session.Save(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save session"})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"token": token,
-		"user":  user,
+		"message": "Login successful",
+		"user":    user,
 	})
 }
 
+func Logout(c *gin.Context) {
+	session := sessions.Default(c)
+	session.Clear()
+	session.Save()
+	c.JSON(http.StatusOK, gin.H{"message": "Logged out successfully"})
+}
+
 func GetProfile(c *gin.Context) {
-	userID := c.MustGet("userID").(uint)
+	userID, ok := utils.GetUserID(c)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid user ID in session"})
+		return
+	}
 
 	var user models.User
 	if err := config.DB.First(&user, userID).Error; err != nil {

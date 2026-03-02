@@ -3,7 +3,6 @@ package config
 import (
 	"fmt"
 	"log"
-	"os"
 
 	"github.com/hedwi/certhub/models"
 	"gorm.io/driver/postgres"
@@ -13,12 +12,9 @@ import (
 var DB *gorm.DB
 
 func InitDB() {
-	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=disable TimeZone=Asia/Shanghai",
-		os.Getenv("DB_HOST"),
-		os.Getenv("DB_USER"),
-		os.Getenv("DB_PASSWORD"),
-		os.Getenv("DB_NAME"),
-		os.Getenv("DB_PORT"),
+	d := Cfg.Database
+	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=%s TimeZone=Asia/Shanghai",
+		d.Host, d.User, d.Password, d.DBName, d.Port, d.SSLMode,
 	)
 	var err error
 	DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})

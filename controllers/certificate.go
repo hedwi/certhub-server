@@ -9,6 +9,7 @@ import (
 	"github.com/hedwi/certhub/config"
 	"github.com/hedwi/certhub/models"
 	"github.com/hedwi/certhub/services"
+	"github.com/hedwi/certhub/utils"
 )
 
 type GenerateCertInput struct {
@@ -22,7 +23,11 @@ func GenerateCertificate(c *gin.Context) {
 		return
 	}
 
-	userID := c.MustGet("userID").(uint)
+	userID, ok := utils.GetUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
 
 	var user models.User
 	if err := config.DB.First(&user, userID).Error; err != nil {
@@ -79,7 +84,11 @@ func GenerateCertificate(c *gin.Context) {
 }
 
 func ListCertificates(c *gin.Context) {
-	userID := c.MustGet("userID").(uint)
+	userID, ok := utils.GetUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
 
 	var certs []models.Certificate
 	if err := config.DB.Where("user_id = ?", userID).Find(&certs).Error; err != nil {
@@ -103,7 +112,11 @@ func ListCertificates(c *gin.Context) {
 
 func DownloadCertificate(c *gin.Context) {
 	certID := c.Param("id")
-	userID := c.MustGet("userID").(uint)
+	userID, ok := utils.GetUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
 
 	var cert models.Certificate
 	if err := config.DB.Where("id = ? AND user_id = ?", certID, userID).First(&cert).Error; err != nil {

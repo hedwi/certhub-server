@@ -6,13 +6,13 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"errors"
-	"os"
 
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/certificate"
 	"github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/providers/dns/cloudflare"
 	"github.com/go-acme/lego/v4/registration"
+	"github.com/hedwi/certhub/config"
 )
 
 type MyUser struct {
@@ -43,16 +43,14 @@ func ObtainCertificate(domain string, email string) (*certificate.Resource, erro
 		key:   privateKey,
 	}
 
-	config := lego.NewConfig(myUser)
-
-	// Default to Let's Encrypt production. Override via env for testing.
-	config.CADirURL = os.Getenv("ACME_CA_URL")
-	if config.CADirURL == "" {
-		config.CADirURL = lego.LEDirectoryProduction
+	legoCfg := lego.NewConfig(myUser)
+	legoCfg.CADirURL = config.Cfg.ACME.CAURL
+	if legoCfg.CADirURL == "" {
+		legoCfg.CADirURL = lego.LEDirectoryProduction
 	}
-	config.Certificate.KeyType = certcrypto.RSA2048
+	legoCfg.Certificate.KeyType = certcrypto.RSA2048
 
-	client, err := lego.NewClient(config)
+	client, err := lego.NewClient(legoCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -83,23 +81,27 @@ func ObtainCertificate(domain string, email string) (*certificate.Resource, erro
 }
 
 func setupDNSProvider(client *lego.Client) error {
-	// The CNAME setup works automatically with Lego if the provider follows CNAMEs.
-	// We'll configure our main provider (e.g. Cloudflare) to answer the challenge
-	// for the domain the CNAME points to.
-
-	providerName := os.Getenv("DNS_PROVIDER") // e.g. "cloudflare"
+	providerName := config.Cfg.DNS.Provider
+	if providerName == "" {
+		providerName = "cloudflare"
+	}
 
 	if providerName == "cloudflare" {
-		config := cloudflare.NewDefaultConfig()
-		// Will automatically read CF_API_EMAIL(or CLOUDFLARE_EMAIL) and CF_API_KEY from env
+		cf := config.Cfg.DNS.Cloudflare
+		cfCfg := &cloudflare.Config{}
+		if cf.APIToken != "" {
+			cfCfg.AuthToken = cf.APIToken
+		} else {
+			cfCfg.AuthEmail = cf.APIEmail
+			cfCfg.AuthKey = cf.APIKey
+		}
 
-		p, err := cloudflare.NewDNSProviderConfig(config)
+		p, err := cloudflare.NewDNSProviderConfig(cfCfg)
 		if err != nil {
 			return err
 		}
 
-		err = client.Challenge.SetDNS01Provider(p)
-		return err
+		return client.Challenge.SetDNS01Provider(p)
 	}
 
 	return errors.New("Unsupported or missing DNS_PROVIDER config (e.g., 'cloudflare')")

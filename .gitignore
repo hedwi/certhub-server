@@ -27,6 +27,9 @@ go.work.sum
 # env file
 .env
 
+# config with secrets
+config.toml
+
 # Editor/IDE
 # .idea/
 # .vscode/

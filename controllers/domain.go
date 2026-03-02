@@ -2,11 +2,11 @@ package controllers
 
 import (
 	"net/http"
-	"os"
 
 	"github.com/gin-gonic/gin"
 	"github.com/hedwi/certhub/config"
 	"github.com/hedwi/certhub/models"
+	"github.com/hedwi/certhub/utils"
 )
 
 type DomainInput struct {
@@ -20,7 +20,11 @@ func AddDomain(c *gin.Context) {
 		return
 	}
 
-	userID := c.MustGet("userID").(uint)
+	userID, ok := utils.GetUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
 
 	// Check if domain already exists
 	var existing models.Domain
@@ -41,10 +45,7 @@ func AddDomain(c *gin.Context) {
 	}
 
 	cnameHost := "_acme-challenge." + input.Domain
-	cnameTarget := os.Getenv("CNAME_TARGET")
-	if cnameTarget == "" {
-		cnameTarget = "cname.yourservice.com"
-	}
+	cnameTarget := config.Cfg.Domain.CNameTarget
 
 	c.JSON(http.StatusCreated, gin.H{
 		"message":      "Domain added successfully",
@@ -55,7 +56,11 @@ func AddDomain(c *gin.Context) {
 }
 
 func ListDomains(c *gin.Context) {
-	userID := c.MustGet("userID").(uint)
+	userID, ok := utils.GetUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
 
 	var domains []models.Domain
 	if err := config.DB.Where("user_id = ?", userID).Find(&domains).Error; err != nil {
@@ -68,7 +73,11 @@ func ListDomains(c *gin.Context) {
 
 func DeleteDomain(c *gin.Context) {
 	domainID := c.Param("id")
-	userID := c.MustGet("userID").(uint)
+	userID, ok := utils.GetUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
 
 	var domain models.Domain
 	if err := config.DB.Where("id = ? AND user_id = ?", domainID, userID).First(&domain).Error; err != nil {
@@ -86,7 +95,11 @@ func DeleteDomain(c *gin.Context) {
 
 func GetDomain(c *gin.Context) {
 	domainID := c.Param("id")
-	userID := c.MustGet("userID").(uint)
+	userID, ok := utils.GetUserID(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
 
 	var domain models.Domain
 	if err := config.DB.Where("id = ? AND user_id = ?", domainID, userID).First(&domain).Error; err != nil {
