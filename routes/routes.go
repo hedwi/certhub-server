@@ -1,6 +1,8 @@
 package routes
 
 import (
+	"net/http"
+
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-gonic/gin"
@@ -9,10 +11,21 @@ import (
 	"github.com/hedwi/certhub-server/middleware"
 )
 
+func parseSameSite(value string) http.SameSite {
+	switch value {
+	case "strict":
+		return http.SameSiteStrictMode
+	case "none":
+		return http.SameSiteNoneMode
+	default:
+		return http.SameSiteLaxMode
+	}
+}
+
 func SetupRouter() *gin.Engine {
 	r := gin.Default()
+	r.Use(middleware.RateLimitMiddleware())
 
-	// Configure session middleware from config
 	s := config.Cfg.Session
 	store := cookie.NewStore([]byte(s.Secret))
 	store.Options(sessions.Options{
@@ -20,10 +33,13 @@ func SetupRouter() *gin.Engine {
 		Path:     s.Path,
 		HttpOnly: s.HttpOnly,
 		Secure:   s.Secure,
+		SameSite: parseSameSite(s.SameSite),
 	})
 	r.Use(sessions.Sessions(s.Name, store))
 
-	// CORS middleware could be added here
+	r.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
 
 	api := r.Group("/api")
 	{
@@ -39,16 +55,15 @@ func SetupRouter() *gin.Engine {
 		{
 			protected.GET("/profile", controllers.GetProfile)
 
-			// Routes for domains
 			domains := protected.Group("/domains")
 			{
 				domains.POST("", controllers.AddDomain)
 				domains.GET("", controllers.ListDomains)
 				domains.GET("/:id", controllers.GetDomain)
+				domains.POST("/:id/verify", controllers.VerifyDomain)
 				domains.DELETE("/:id", controllers.DeleteDomain)
 			}
 
-			// Routes for certificates
 			certs := protected.Group("/certificates")
 			{
 				certs.POST("/generate", controllers.GenerateCertificate)

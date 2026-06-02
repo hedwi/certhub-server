@@ -2,16 +2,26 @@ package main
 
 import (
 	"log"
+	"log/slog"
 
 	"github.com/hedwi/certhub-server/config"
 	"github.com/hedwi/certhub-server/routes"
+	"github.com/hedwi/certhub-server/services"
+	"github.com/hedwi/certhub-server/utils"
 )
 
 func main() {
-	// Initialize the database connection
+	utils.InitLogger()
+
+	if err := config.Validate(); err != nil {
+		log.Fatalf("Invalid configuration: %v", err)
+	}
+	if err := services.InitCrypto(); err != nil {
+		log.Fatalf("Failed to init encryption: %v", err)
+	}
+
 	config.InitDB()
 
-	// Setup and start Gin router
 	r := routes.SetupRouter()
 
 	addr := config.Cfg.Server.Addr
@@ -22,9 +32,8 @@ func main() {
 		addr = ":"
 	}
 
-	log.Printf("Starting server on %s%s", addr, port)
-	err := r.Run(addr + port)
-	if err != nil {
+	slog.Info("starting server", "addr", addr+port)
+	if err := r.Run(addr + port); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
 	}
 }

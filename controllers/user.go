@@ -48,7 +48,10 @@ func Register(c *gin.Context) {
 	// Set session
 	session := sessions.Default(c)
 	session.Set("user_id", user.ID)
-	session.Save()
+	if err := session.Save(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save session"})
+		return
+	}
 
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "User registered successfully",
