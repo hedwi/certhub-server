@@ -7,12 +7,20 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/hedwi/certhub-server/config"
 	"github.com/hedwi/certhub-server/models"
-	"github.com/hedwi/certhub-server/services"
 	"github.com/hedwi/certhub-server/utils"
 )
 
 type DomainInput struct {
-	Domain string `json:"domain" binding:"required"`
+	Name   string `json:"name"`
+	Domain string `json:"domain"`
+}
+
+func domainNameFromInput(input DomainInput) string {
+	name := input.Name
+	if name == "" {
+		name = input.Domain
+	}
+	return normalizeDomain(name)
 }
 
 func normalizeDomain(domain string) string {
@@ -22,25 +30,24 @@ func normalizeDomain(domain string) string {
 func AddDomain(c *gin.Context) {
 	var input DomainInput
 	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		utils.RespondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	userID, ok := utils.GetUserID(c)
+	userID, ok := requireUserID(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return
 	}
 
-	domainName := normalizeDomain(input.Domain)
+	domainName := domainNameFromInput(input)
 	if domainName == "" || strings.Contains(domainName, " ") {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid domain name"})
+		utils.RespondError(c, http.StatusBadRequest, "Invalid domain name")
 		return
 	}
 
 	var existing models.Domain
 	if err := config.DB.Where("domain = ?", domainName).First(&existing).Error; err == nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "Domain already registered"})
+		utils.RespondError(c, http.StatusConflict, "Domain already registered")
 		return
 	}
 
@@ -51,7 +58,7 @@ func AddDomain(c *gin.Context) {
 	}
 
 	if err := config.DB.Create(&domain).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create domain"})
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to create domain")
 		return
 	}
 
@@ -59,112 +66,55 @@ func AddDomain(c *gin.Context) {
 	domain.CNameTarget = delegationTarget
 	config.DB.Model(&domain).Update("cname_target", delegationTarget)
 
-	cnameHost := "_acme-challenge." + domainName
-
-	c.JSON(http.StatusCreated, gin.H{
-		"message":      "Domain added successfully",
-		"domain":       domain,
-		"cname_host":   cnameHost,
-		"cname_target": delegationTarget,
-		"instructions": "Create a CNAME record pointing " + cnameHost + " to " + delegationTarget,
-	})
-}
-
-func VerifyDomain(c *gin.Context) {
-	domainID := c.Param("id")
-	userID, ok := utils.GetUserID(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
-		return
-	}
-
-	var domain models.Domain
-	if err := config.DB.Where("id = ? AND user_id = ?", domainID, userID).First(&domain).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Domain not found"})
-		return
-	}
-
-	if err := services.VerifyChallengeCNAME(domain.Domain, domain.CNameTarget); err != nil {
-		config.DB.Model(&domain).Updates(map[string]interface{}{
-			"status":        "error",
-			"error_message": err.Error(),
-		})
-		c.JSON(http.StatusBadRequest, gin.H{
-			"verified": false,
-			"error":    err.Error(),
-		})
-		return
-	}
-
-	config.DB.Model(&domain).Updates(map[string]interface{}{
-		"status":        "verified",
-		"error_message": "",
-	})
-
-	c.JSON(http.StatusOK, gin.H{
-		"verified": true,
-		"message":  "CNAME delegation verified; you may request a certificate",
-	})
+	utils.RespondSuccess(c, loadDomainDTO(domain))
 }
 
 func ListDomains(c *gin.Context) {
-	userID, ok := utils.GetUserID(c)
+	userID, ok := requireUserID(c)
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return
 	}
 
 	var domains []models.Domain
-	if err := config.DB.Where("user_id = ?", userID).Find(&domains).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch domains"})
+	if err := config.DB.Where("user_id = ?", userID).Order("created_at desc").Find(&domains).Error; err != nil {
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to fetch domains")
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"domains": domains})
+	result := make([]DomainDTO, 0, len(domains))
+	for _, d := range domains {
+		result = append(result, loadDomainDTO(d))
+	}
+	utils.RespondSuccess(c, result)
+}
+
+func GetDomain(c *gin.Context) {
+	domain, ok := getDomainOwned(c, c.Param("id"))
+	if !ok {
+		return
+	}
+	utils.RespondSuccess(c, loadDomainDTO(domain))
 }
 
 func DeleteDomain(c *gin.Context) {
-	domainID := c.Param("id")
-	userID, ok := utils.GetUserID(c)
+	domain, ok := getDomainOwned(c, c.Param("id"))
 	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
-		return
-	}
-
-	var domain models.Domain
-	if err := config.DB.Where("id = ? AND user_id = ?", domainID, userID).First(&domain).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Domain not found"})
 		return
 	}
 
 	if domain.Status == "generating" {
-		c.JSON(http.StatusConflict, gin.H{"error": "Cannot delete domain while certificate generation is in progress"})
+		utils.RespondError(c, http.StatusConflict, "Cannot delete domain while certificate generation is in progress")
 		return
 	}
 
 	config.DB.Where("domain_id = ?", domain.ID).Delete(&models.Certificate{})
+	config.DB.Where("domain_id = ?", domain.ID).Delete(&models.DeployTarget{})
+	config.DB.Where("domain_id = ?", domain.ID).Delete(&models.DeployJob{})
 
 	if err := config.DB.Delete(&domain).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete domain"})
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to delete domain")
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Domain deleted successfully"})
-}
-
-func GetDomain(c *gin.Context) {
-	domainID := c.Param("id")
-	userID, ok := utils.GetUserID(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
-		return
-	}
-
-	var domain models.Domain
-	if err := config.DB.Where("id = ? AND user_id = ?", domainID, userID).First(&domain).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Domain not found"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"domain": domain})
+	utils.RespondSuccess(c, nil)
 }

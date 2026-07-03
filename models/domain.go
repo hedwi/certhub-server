@@ -11,7 +11,9 @@ type Domain struct {
 	UserID       uint           `gorm:"index;not null" json:"user_id"`
 	Domain       string         `gorm:"uniqueIndex;not null" json:"domain"`
 	Status       string         `gorm:"default:'pending'" json:"status"` // pending, verified, generating, active, error
-	CNameTarget  string         `json:"cname_target"`                    // per-domain delegation FQDN
+	CNameTarget  string         `json:"cname_target"` // per-domain delegation FQDN
+	DNSProvider  string         `json:"dns_provider,omitempty"`
+	DNSZoneID    string         `json:"dns_zone_id,omitempty"`
 	ErrorMessage string         `gorm:"type:text" json:"error_message,omitempty"`
 	CreatedAt    time.Time      `json:"created_at"`
 	UpdatedAt    time.Time      `json:"updated_at"`

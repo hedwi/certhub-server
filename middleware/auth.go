@@ -1,10 +1,9 @@
 package middleware
 
 import (
-	"net/http"
-
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-gonic/gin"
+	"github.com/hedwi/certhub-server/utils"
 )
 
 func AuthMiddleware() gin.HandlerFunc {
@@ -13,7 +12,7 @@ func AuthMiddleware() gin.HandlerFunc {
 		userID := session.Get("user_id")
 
 		if userID == nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized, please login"})
+			utils.RespondNeedLogin(c)
 			c.Abort()
 			return
 		}

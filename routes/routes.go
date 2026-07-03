@@ -25,6 +25,7 @@ func parseSameSite(value string) http.SameSite {
 func SetupRouter() *gin.Engine {
 	r := gin.Default()
 	r.Use(middleware.RateLimitMiddleware())
+	r.Use(middleware.CORSMiddleware())
 
 	s := config.Cfg.Session
 	store := cookie.NewStore([]byte(s.Secret))
@@ -60,10 +61,25 @@ func SetupRouter() *gin.Engine {
 				domains.POST("", controllers.AddDomain)
 				domains.GET("", controllers.ListDomains)
 				domains.GET("/:id", controllers.GetDomain)
-				domains.POST("/:id/verify", controllers.VerifyDomain)
 				domains.DELETE("/:id", controllers.DeleteDomain)
+
+				domains.GET("/:id/cname", controllers.GetCname)
+				domains.PUT("/:id/cname", controllers.UpdateCname)
+				domains.POST("/:id/cname/verify", controllers.VerifyCname)
+
+				domains.POST("/:id/certificate/issue", controllers.IssueCertificate)
+				domains.GET("/:id/certificate", controllers.GetCertificateInfo)
+				domains.GET("/:id/certificate/download", controllers.DownloadDomainCertificate)
+
+				domains.GET("/:id/deploy/targets", controllers.ListDeployTargets)
+				domains.POST("/:id/deploy/targets", controllers.AddDeployTarget)
+				domains.PUT("/:id/deploy/targets/:targetId", controllers.UpdateDeployTarget)
+				domains.DELETE("/:id/deploy/targets/:targetId", controllers.DeleteDeployTarget)
+				domains.POST("/:id/deploy", controllers.DeployDomain)
+				domains.GET("/:id/deploy/jobs/:jobId", controllers.GetDeployJob)
 			}
 
+			// Legacy certificate routes for direct API clients
 			certs := protected.Group("/certificates")
 			{
 				certs.POST("/generate", controllers.GenerateCertificate)

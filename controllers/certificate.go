@@ -1,6 +1,8 @@
 package controllers
 
 import (
+	"archive/zip"
+	"bytes"
 	"log/slog"
 	"net/http"
 	"time"
@@ -12,10 +14,6 @@ import (
 	"github.com/hedwi/certhub-server/services"
 	"github.com/hedwi/certhub-server/utils"
 )
-
-type GenerateCertInput struct {
-	DomainID uint `json:"domain_id" binding:"required"`
-}
 
 func setDomainError(domainID uint, status, message string) {
 	config.DB.Model(&models.Domain{}).Where("id = ?", domainID).Updates(map[string]interface{}{
@@ -75,7 +73,6 @@ func runCertJob(domain models.Domain, user models.User, renew bool) {
 	}
 
 	config.DB.Where("domain_id = ?", domain.ID).Delete(&models.Certificate{})
-
 	if err := config.DB.Create(&certRecord).Error; err != nil {
 		slog.Error("failed to save certificate", "domain", domain.Domain, "error", err)
 		setDomainError(domain.ID, "error", "failed to save certificate")
@@ -89,155 +86,72 @@ func runCertJob(domain models.Domain, user models.User, renew bool) {
 	slog.Info("certificate saved", "domain", domain.Domain, "expires_at", expiresAt, "renew", renew)
 }
 
-func beginCertOperation(c *gin.Context, domainID, userID uint, renew bool) (*models.Domain, *models.User, bool) {
-	var domain models.Domain
-	if err := config.DB.Where("id = ? AND user_id = ?", domainID, userID).First(&domain).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Domain not found or unauthorized"})
-		return nil, nil, false
-	}
-
+func beginCertOperation(c *gin.Context, domain models.Domain, userID uint, renew bool) (*models.User, bool) {
 	if err := services.VerifyChallengeCNAME(domain.Domain, domain.CNameTarget); err != nil {
 		setDomainError(domain.ID, "error", err.Error())
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return nil, nil, false
+		utils.RespondSuccess(c, gin.H{
+			"status":  "failed",
+			"message": err.Error(),
+		})
+		return nil, false
 	}
 
 	if renew {
 		var existing models.Certificate
 		if err := config.DB.Where("domain_id = ?", domain.ID).First(&existing).Error; err != nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "No certificate found for this domain"})
-			return nil, nil, false
+			utils.RespondError(c, http.StatusNotFound, "No certificate found for this domain")
+			return nil, false
 		}
 	}
 
 	result := config.DB.Model(&models.Domain{}).
-		Where("id = ? AND user_id = ? AND status NOT IN ?", domainID, userID, []string{"generating"}).
+		Where("id = ? AND user_id = ? AND status NOT IN ?", domain.ID, userID, []string{"generating"}).
 		Updates(map[string]interface{}{"status": "generating", "error_message": ""})
 	if result.Error != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update domain status"})
-		return nil, nil, false
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to update domain status")
+		return nil, false
 	}
 	if result.RowsAffected == 0 {
-		c.JSON(http.StatusConflict, gin.H{"error": "Certificate operation already in progress for this domain"})
-		return nil, nil, false
+		utils.RespondError(c, http.StatusConflict, "Certificate operation already in progress for this domain")
+		return nil, false
 	}
 
 	var user models.User
 	if err := config.DB.First(&user, userID).Error; err != nil {
 		setDomainError(domain.ID, "error", "user not found")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "User not found"})
-		return nil, nil, false
+		utils.RespondError(c, http.StatusInternalServerError, "User not found")
+		return nil, false
 	}
-
-	return &domain, &user, true
+	return &user, true
 }
 
-func GenerateCertificate(c *gin.Context) {
-	var input GenerateCertInput
-	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+func writeCertificateZip(c *gin.Context, domainName string, cert *models.Certificate, keyPEM []byte) {
+	buf := new(bytes.Buffer)
+	zw := zip.NewWriter(buf)
+
+	files := map[string][]byte{
+		"cert.pem":      cert.CertPEM,
+		"privkey.pem":   keyPEM,
+		"chain.pem":     cert.Issuer,
+		"fullchain.pem": append(append(cert.CertPEM, '\n'), cert.Issuer...),
+	}
+	for name, content := range files {
+		w, err := zw.Create(name)
+		if err != nil {
+			utils.RespondError(c, http.StatusInternalServerError, "Failed to create zip")
+			return
+		}
+		if _, err := w.Write(content); err != nil {
+			utils.RespondError(c, http.StatusInternalServerError, "Failed to write zip")
+			return
+		}
+	}
+	if err := zw.Close(); err != nil {
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to finalize zip")
 		return
 	}
 
-	userID, ok := utils.GetUserID(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
-		return
-	}
-
-	domain, user, ok := beginCertOperation(c, input.DomainID, userID, false)
-	if !ok {
-		return
-	}
-
-	go runCertJob(*domain, *user, false)
-
-	c.JSON(http.StatusAccepted, gin.H{
-		"message": "Certificate generation started. Poll GET /api/domains/:id for status.",
-	})
-}
-
-func ListCertificates(c *gin.Context) {
-	userID, ok := utils.GetUserID(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
-		return
-	}
-
-	var certs []models.Certificate
-	if err := config.DB.Where("user_id = ?", userID).Find(&certs).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch certificates"})
-		return
-	}
-
-	var res []interface{}
-	for _, cert := range certs {
-		res = append(res, gin.H{
-			"id":         cert.ID,
-			"domain_id":  cert.DomainID,
-			"domain":     cert.Domain,
-			"expires_at": cert.ExpiresAt,
-			"created_at": cert.CreatedAt,
-		})
-	}
-
-	c.JSON(http.StatusOK, gin.H{"certificates": res})
-}
-
-func DownloadCertificate(c *gin.Context) {
-	certID := c.Param("id")
-	userID, ok := utils.GetUserID(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
-		return
-	}
-
-	var cert models.Certificate
-	if err := config.DB.Where("id = ? AND user_id = ?", certID, userID).First(&cert).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Certificate not found"})
-		return
-	}
-
-	keyPEM, err := services.Decrypt(cert.KeyPEM)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to decrypt private key"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"domain":      cert.Domain,
-		"certificate": string(cert.CertPEM),
-		"private_key": string(keyPEM),
-		"issuer":      string(cert.Issuer),
-		"expires_at":  cert.ExpiresAt,
-	})
-}
-
-type RenewCertInput struct {
-	DomainID uint `json:"domain_id" binding:"required"`
-}
-
-func RenewCertificate(c *gin.Context) {
-	var input RenewCertInput
-	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	userID, ok := utils.GetUserID(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
-		return
-	}
-
-	domain, user, ok := beginCertOperation(c, input.DomainID, userID, true)
-	if !ok {
-		return
-	}
-
-	go runCertJob(*domain, *user, true)
-
-	c.JSON(http.StatusAccepted, gin.H{
-		"message": "Certificate renewal started. Poll GET /api/domains/:id for status.",
-	})
+	filename := domainName + "-certificate.zip"
+	c.Header("Content-Disposition", "attachment; filename=\""+filename+"\"")
+	c.Data(http.StatusOK, "application/zip", buf.Bytes())
 }

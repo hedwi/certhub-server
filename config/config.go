@@ -26,8 +26,9 @@ type Config struct {
 
 // ServerConfig 服务器配置
 type ServerConfig struct {
-	Port string `toml:"port"`
-	Addr string `toml:"addr"`
+	Port           string   `toml:"port"`
+	Addr           string   `toml:"addr"`
+	AllowedOrigins []string `toml:"allowed_origins"`
 }
 
 // DatabaseConfig 数据库配置
