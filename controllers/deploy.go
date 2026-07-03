@@ -2,10 +2,8 @@ package controllers
 
 import (
 	"encoding/json"
-	"log/slog"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/hedwi/certhub-server/config"
@@ -28,11 +26,10 @@ type DeployTargetInput struct {
 	ReloadCommand string `json:"reloadCommand"`
 }
 
-type DeployInput struct {
-	TargetIDs []string `json:"targetIds"`
-}
-
 func ListDeployTargets(c *gin.Context) {
+	if !requireDeployAPI(c) {
+		return
+	}
 	domain, ok := getDomainOwned(c, c.Param("id"))
 	if !ok {
 		return
@@ -52,6 +49,9 @@ func ListDeployTargets(c *gin.Context) {
 }
 
 func AddDeployTarget(c *gin.Context) {
+	if !requireDeployAPI(c) {
+		return
+	}
 	domain, ok := getDomainOwned(c, c.Param("id"))
 	if !ok {
 		return
@@ -108,6 +108,9 @@ func AddDeployTarget(c *gin.Context) {
 }
 
 func UpdateDeployTarget(c *gin.Context) {
+	if !requireDeployAPI(c) {
+		return
+	}
 	domain, ok := getDomainOwned(c, c.Param("id"))
 	if !ok {
 		return
@@ -145,15 +148,19 @@ func UpdateDeployTarget(c *gin.Context) {
 	}
 	if input.PrivateKey != "" {
 		enc, err := services.Encrypt([]byte(input.PrivateKey))
-		if err == nil {
-			updates["private_key_pem"] = enc
+		if err != nil {
+			utils.RespondError(c, http.StatusInternalServerError, "Failed to encrypt private key")
+			return
 		}
+		updates["private_key_pem"] = enc
 	}
 	if input.Password != "" {
 		enc, err := services.Encrypt([]byte(input.Password))
-		if err == nil {
-			updates["password_enc"] = enc
+		if err != nil {
+			utils.RespondError(c, http.StatusInternalServerError, "Failed to encrypt password")
+			return
 		}
+		updates["password_enc"] = enc
 	}
 	config.DB.Model(&target).Updates(updates)
 	config.DB.Where("id = ?", target.ID).First(&target)
@@ -161,6 +168,9 @@ func UpdateDeployTarget(c *gin.Context) {
 }
 
 func DeleteDeployTarget(c *gin.Context) {
+	if !requireDeployAPI(c) {
+		return
+	}
 	domain, ok := getDomainOwned(c, c.Param("id"))
 	if !ok {
 		return
@@ -184,63 +194,15 @@ func DeleteDeployTarget(c *gin.Context) {
 }
 
 func DeployDomain(c *gin.Context) {
-	domain, ok := getDomainOwned(c, c.Param("id"))
-	if !ok {
+	if !requireDeployExecution(c) {
 		return
 	}
-	userID, ok := requireUserID(c)
-	if !ok {
-		return
-	}
-
-	cert := loadCertificate(domain.ID)
-	if cert == nil {
-		utils.RespondError(c, http.StatusBadRequest, "No certificate available to deploy")
-		return
-	}
-
-	var input DeployInput
-	_ = c.ShouldBindJSON(&input)
-
-	query := config.DB.Where("domain_id = ? AND enabled = ?", domain.ID, true)
-	if len(input.TargetIDs) > 0 {
-		ids := make([]uint, 0, len(input.TargetIDs))
-		for _, raw := range input.TargetIDs {
-			if id, ok := parseDomainID(raw); ok {
-				ids = append(ids, id)
-			}
-		}
-		if len(ids) > 0 {
-			query = query.Where("id IN ?", ids)
-		}
-	}
-
-	var targets []models.DeployTarget
-	if err := query.Find(&targets).Error; err != nil || len(targets) == 0 {
-		utils.RespondError(c, http.StatusBadRequest, "No deploy targets configured")
-		return
-	}
-
-	job := models.DeployJob{
-		DomainID: domain.ID,
-		UserID:   userID,
-		Status:   "pending",
-	}
-	if err := config.DB.Create(&job).Error; err != nil {
-		utils.RespondError(c, http.StatusInternalServerError, "Failed to create deploy job")
-		return
-	}
-
-	go runDeployJob(job, domain, targets, cert)
-
-	utils.RespondSuccess(c, gin.H{
-		"jobId":   strconv.FormatUint(uint64(job.ID), 10),
-		"status":  "pending",
-		"message": "Deploy job started",
-	})
 }
 
 func GetDeployJob(c *gin.Context) {
+	if !requireDeployAPI(c) {
+		return
+	}
 	domain, ok := getDomainOwned(c, c.Param("id"))
 	if !ok {
 		return
@@ -257,58 +219,6 @@ func GetDeployJob(c *gin.Context) {
 		return
 	}
 	utils.RespondSuccess(c, toDeployJobDTO(job))
-}
-
-func runDeployJob(job models.DeployJob, domain models.Domain, targets []models.DeployTarget, cert *models.Certificate) {
-	results := make([]DeployJobTargetDTO, 0, len(targets))
-	allOK := true
-
-	for _, target := range targets {
-		entry := DeployJobTargetDTO{
-			TargetID:   strconv.FormatUint(uint64(target.ID), 10),
-			TargetName: target.Name,
-			Status:     "success",
-			Message:    "Certificate staged for deployment",
-		}
-
-		switch target.Type {
-		case "ssh":
-			if target.Host == "" {
-				entry.Status = "failed"
-				entry.Message = "SSH host not configured"
-				allOK = false
-			}
-		case "webhook", "api":
-			if target.Host == "" {
-				entry.Status = "failed"
-				entry.Message = "Endpoint host not configured"
-				allOK = false
-			}
-		default:
-			entry.Message = "Deploy recorded (type: " + target.Type + ")"
-		}
-
-		now := time.Now()
-		lastStatus := entry.Status
-		config.DB.Model(&target).Updates(map[string]interface{}{
-			"last_deploy_at": &now,
-			"last_status":    lastStatus,
-		})
-		results = append(results, entry)
-	}
-
-	status := "success"
-	if !allOK {
-		status = "failed"
-	}
-	finished := time.Now()
-	payload, _ := json.Marshal(results)
-	config.DB.Model(&job).Updates(map[string]interface{}{
-		"status":       status,
-		"targets_json": payload,
-		"finished_at":  &finished,
-	})
-	slog.Info("deploy job finished", "job_id", job.ID, "domain", domain.Domain, "status", status, "cert_id", cert.ID)
 }
 
 func toDeployJobDTO(job models.DeployJob) DeployJobDTO {

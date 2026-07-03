@@ -27,6 +27,11 @@ func issueCertificateInternal(c *gin.Context, domainID uint, forceRenew bool) {
 		return
 	}
 
+	if !forceRenew && loadCertificate(domain.ID) != nil {
+		utils.RespondError(c, http.StatusConflict, "Certificate already exists; set forceRenew to true or use the renew endpoint")
+		return
+	}
+
 	user, ok := beginCertOperation(c, domain, userID, forceRenew)
 	if !ok {
 		return

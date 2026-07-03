@@ -64,7 +64,6 @@ func SetupRouter() *gin.Engine {
 				domains.DELETE("/:id", controllers.DeleteDomain)
 
 				domains.GET("/:id/cname", controllers.GetCname)
-				domains.PUT("/:id/cname", controllers.UpdateCname)
 				domains.POST("/:id/cname/verify", controllers.VerifyCname)
 
 				domains.POST("/:id/certificate/issue", controllers.IssueCertificate)

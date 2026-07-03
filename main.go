@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"log"
 	"log/slog"
 
 	"github.com/hedwi/certhub-server/config"
+	"github.com/hedwi/certhub-server/controllers"
 	"github.com/hedwi/certhub-server/routes"
 	"github.com/hedwi/certhub-server/services"
 	"github.com/hedwi/certhub-server/utils"
@@ -21,6 +23,8 @@ func main() {
 	}
 
 	config.InitDB()
+
+	go controllers.StartRenewalScheduler(context.Background())
 
 	r := routes.SetupRouter()
 

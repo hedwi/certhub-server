@@ -8,9 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
+
+const defaultSessionSecret = "certhub-secret-change-in-production"
 
 // Config 应用配置
 type Config struct {
@@ -22,6 +25,59 @@ type Config struct {
 	Domain    DomainConfig    `toml:"domain"`
 	Security  SecurityConfig  `toml:"security"`
 	RateLimit RateLimitConfig `toml:"ratelimit"`
+	Renewal   RenewalConfig   `toml:"renewal"`
+	Deploy    DeployConfig    `toml:"deploy"`
+}
+
+// RenewalConfig controls automatic certificate renewal.
+type RenewalConfig struct {
+	Enabled                *bool  `toml:"enabled"`
+	CheckInterval          string `toml:"check_interval"`           // e.g. "1h", "30m"
+	RenewBeforeDays        int    `toml:"renew_before_days"`        // renew when expiry is within this many days
+	GeneratingTimeout      string `toml:"generating_timeout"`       // e.g. "15m"; reset stuck generating domains after this
+	GeneratingCheckInterval string `toml:"generating_check_interval"` // how often to scan for stuck generating domains
+}
+
+// IsEnabled reports whether auto-renewal is on (default true).
+func (r RenewalConfig) IsEnabled() bool {
+	if r.Enabled == nil {
+		return true
+	}
+	return *r.Enabled
+}
+
+// GeneratingTimeoutDuration returns how long a generating job may run before rollback.
+func (r RenewalConfig) GeneratingTimeoutDuration() time.Duration {
+	return parseDurationDefault(r.GeneratingTimeout, 15*time.Minute)
+}
+
+// GeneratingCheckIntervalDuration returns how often stuck generating domains are scanned.
+func (r RenewalConfig) GeneratingCheckIntervalDuration() time.Duration {
+	return parseDurationDefault(r.GeneratingCheckInterval, 5*time.Minute)
+}
+
+func parseDurationDefault(value string, fallback time.Duration) time.Duration {
+	if value == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return fallback
+	}
+	return d
+}
+
+// DeployConfig controls certificate deploy API availability.
+type DeployConfig struct {
+	Enabled *bool `toml:"enabled"`
+}
+
+// IsEnabled reports whether the deploy API is exposed (default false).
+func (d DeployConfig) IsEnabled() bool {
+	if d.Enabled == nil {
+		return false
+	}
+	return *d.Enabled
 }
 
 // ServerConfig 服务器配置
@@ -79,6 +135,24 @@ type DomainConfig struct {
 // SecurityConfig 安全配置
 type SecurityConfig struct {
 	EncryptionKey string `toml:"encryption_key"` // base64-encoded 32-byte AES-256 key
+	DevMode       *bool  `toml:"dev_mode"`       // allow unencrypted key storage (local dev only)
+}
+
+// IsDevMode reports whether dev-only relaxations are enabled.
+// CERTHUB_DEV env var (true/1) overrides config when set.
+func (s SecurityConfig) IsDevMode() bool {
+	if v, ok := os.LookupEnv("CERTHUB_DEV"); ok {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			return true
+		case "0", "false", "no", "off":
+			return false
+		}
+	}
+	if s.DevMode == nil {
+		return false
+	}
+	return *s.DevMode
 }
 
 // RateLimitConfig 速率限制配置
@@ -135,7 +209,7 @@ func setDefaults() {
 			SSLMode:  "disable",
 		},
 		Session: SessionConfig{
-			Secret:   "certhub-secret-change-in-production",
+			Secret:   defaultSessionSecret,
 			MaxAge:   86400 * 30,
 			Path:     "/",
 			HttpOnly: true,
@@ -156,6 +230,12 @@ func setDefaults() {
 			Enabled:           true,
 			RequestsPerMinute: 60,
 		},
+		Renewal: RenewalConfig{
+			CheckInterval:           "1h",
+			RenewBeforeDays:         30,
+			GeneratingTimeout:       "15m",
+			GeneratingCheckInterval: "5m",
+		},
 	}
 }
 
@@ -170,7 +250,7 @@ func applyDefaults() {
 		Cfg.Database.SSLMode = "disable"
 	}
 	if Cfg.Session.Secret == "" {
-		Cfg.Session.Secret = "certhub-secret-change-in-production"
+		Cfg.Session.Secret = defaultSessionSecret
 	}
 	if Cfg.Session.MaxAge == 0 {
 		Cfg.Session.MaxAge = 86400 * 30
@@ -193,12 +273,24 @@ func applyDefaults() {
 	if Cfg.RateLimit.RequestsPerMinute == 0 {
 		Cfg.RateLimit.RequestsPerMinute = 60
 	}
+	if Cfg.Renewal.CheckInterval == "" {
+		Cfg.Renewal.CheckInterval = "1h"
+	}
+	if Cfg.Renewal.RenewBeforeDays == 0 {
+		Cfg.Renewal.RenewBeforeDays = 30
+	}
+	if Cfg.Renewal.GeneratingTimeout == "" {
+		Cfg.Renewal.GeneratingTimeout = "15m"
+	}
+	if Cfg.Renewal.GeneratingCheckInterval == "" {
+		Cfg.Renewal.GeneratingCheckInterval = "5m"
+	}
 }
 
 // Validate checks critical configuration at startup.
 func Validate() error {
-	if Cfg.Session.Secret == "certhub-secret-change-in-production" {
-		log.Println("WARNING: using default session secret; change session.secret in production")
+	if err := validateSessionAndCORS(); err != nil {
+		return err
 	}
 	if Cfg.DNS.AuthZone == "" {
 		return fmt.Errorf("dns.auth_zone is required (Cloudflare zone for CNAME delegation, e.g. yourservice.com)")
@@ -215,8 +307,39 @@ func Validate() error {
 		if len(key) != 32 {
 			return fmt.Errorf("security.encryption_key must decode to 32 bytes")
 		}
+	} else if Cfg.Security.IsDevMode() {
+		log.Println("WARNING: dev mode: security.encryption_key not set; private keys stored unencrypted")
 	} else {
-		log.Println("WARNING: security.encryption_key not set; private keys stored unencrypted")
+		return fmt.Errorf("security.encryption_key is required (set security.dev_mode = true or CERTHUB_DEV=1 only for local development)")
+	}
+	return nil
+}
+
+func isDefaultSessionSecret(secret string) bool {
+	return secret == "" || secret == defaultSessionSecret
+}
+
+func validateSessionAndCORS() error {
+	if Cfg.Security.IsDevMode() {
+		if isDefaultSessionSecret(Cfg.Session.Secret) {
+			log.Println("WARNING: dev mode: using default session secret")
+		}
+		if len(Cfg.Server.AllowedOrigins) == 0 {
+			log.Println("WARNING: dev mode: server.allowed_origins not set; any origin may access the API with credentials")
+		}
+		return nil
+	}
+
+	if isDefaultSessionSecret(Cfg.Session.Secret) {
+		return fmt.Errorf("session.secret must be set to a unique value in production")
+	}
+	if len(Cfg.Server.AllowedOrigins) == 0 {
+		return fmt.Errorf("server.allowed_origins is required in production (list every trusted frontend origin)")
+	}
+	for _, origin := range Cfg.Server.AllowedOrigins {
+		if origin == "*" {
+			return fmt.Errorf("server.allowed_origins must not contain '*' when credentials are enabled")
+		}
 	}
 	return nil
 }

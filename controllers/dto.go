@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/hedwi/certhub-server/models"
+	"github.com/hedwi/certhub-server/services"
 )
 
 type DomainDTO struct {
@@ -31,7 +32,7 @@ type CnameConfigDTO struct {
 	DomainID     string           `json:"domainId"`
 	Records      []CnameRecordDTO `json:"records"`
 	Instructions string           `json:"instructions,omitempty"`
-	Provider     string           `json:"provider,omitempty"`
+	Note         string           `json:"note,omitempty"`
 	Verified     bool             `json:"verified,omitempty"`
 }
 
@@ -133,13 +134,10 @@ func toDomainDTO(domain models.Domain, cert *models.Certificate) DomainDTO {
 	return dto
 }
 
-func cnameVerified(domain models.Domain) bool {
-	return domain.Status == "verified" || domain.Status == "active" || domain.Status == "generating"
-}
-
 func toCnameConfigDTO(domain models.Domain) CnameConfigDTO {
 	cnameHost := "_acme-challenge." + domain.Domain
-	verified := cnameVerified(domain)
+	verified := domain.CNameTarget != "" &&
+		services.VerifyChallengeCNAME(domain.Domain, domain.CNameTarget) == nil
 	return CnameConfigDTO{
 		DomainID: strconv.FormatUint(uint64(domain.ID), 10),
 		Records: []CnameRecordDTO{{
@@ -148,8 +146,8 @@ func toCnameConfigDTO(domain models.Domain) CnameConfigDTO {
 			Value:    domain.CNameTarget,
 			Verified: verified,
 		}},
-		Instructions: fmt.Sprintf("Add a CNAME record: %s → %s", cnameHost, domain.CNameTarget),
-		Provider:     domain.DNSProvider,
+		Instructions: fmt.Sprintf("Add a CNAME record at your DNS host: %s → %s", cnameHost, domain.CNameTarget),
+		Note: "CNAME delegation: add the record above at any DNS provider. ACME challenge TXT records are published automatically on the delegation target; no DNS API credentials are required from you.",
 		Verified:     verified,
 	}
 }

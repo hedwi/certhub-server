@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/hedwi/certhub-server/config"
 	"github.com/hedwi/certhub-server/models"
 	"github.com/hedwi/certhub-server/utils"
+	"gorm.io/gorm"
 )
 
 type DomainInput struct {
@@ -46,8 +48,29 @@ func AddDomain(c *gin.Context) {
 	}
 
 	var existing models.Domain
-	if err := config.DB.Where("domain = ?", domainName).First(&existing).Error; err == nil {
+	err := config.DB.Unscoped().Where("domain = ?", domainName).First(&existing).Error
+	switch {
+	case err == nil && !existing.DeletedAt.Valid:
 		utils.RespondError(c, http.StatusConflict, "Domain already registered")
+		return
+	case err == nil && existing.UserID == userID:
+		if err := restoreDeletedDomain(&existing); err != nil {
+			utils.RespondError(c, http.StatusInternalServerError, "Failed to restore domain")
+			return
+		}
+		if err := config.DB.Unscoped().First(&existing, existing.ID).Error; err != nil {
+			utils.RespondError(c, http.StatusInternalServerError, "Failed to load restored domain")
+			return
+		}
+		utils.RespondSuccess(c, loadDomainDTO(existing))
+		return
+	case err == nil:
+		if err := permanentlyRemoveDomain(existing.ID); err != nil {
+			utils.RespondError(c, http.StatusInternalServerError, "Failed to create domain")
+			return
+		}
+	case !errors.Is(err, gorm.ErrRecordNotFound):
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to check domain")
 		return
 	}
 
@@ -58,6 +81,10 @@ func AddDomain(c *gin.Context) {
 	}
 
 	if err := config.DB.Create(&domain).Error; err != nil {
+		if errors.Is(err, gorm.ErrDuplicatedKey) {
+			utils.RespondError(c, http.StatusConflict, "Domain already registered")
+			return
+		}
 		utils.RespondError(c, http.StatusInternalServerError, "Failed to create domain")
 		return
 	}
@@ -117,4 +144,20 @@ func DeleteDomain(c *gin.Context) {
 	}
 
 	utils.RespondSuccess(c, nil)
+}
+
+func restoreDeletedDomain(domain *models.Domain) error {
+	return config.DB.Unscoped().Model(domain).Updates(map[string]interface{}{
+		"deleted_at":       nil,
+		"status":           "pending",
+		"error_message":    "",
+		"generating_since": nil,
+	}).Error
+}
+
+func permanentlyRemoveDomain(domainID uint) error {
+	config.DB.Unscoped().Where("domain_id = ?", domainID).Delete(&models.Certificate{})
+	config.DB.Unscoped().Where("domain_id = ?", domainID).Delete(&models.DeployTarget{})
+	config.DB.Unscoped().Where("domain_id = ?", domainID).Delete(&models.DeployJob{})
+	return config.DB.Unscoped().Delete(&models.Domain{}, domainID).Error
 }

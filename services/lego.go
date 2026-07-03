@@ -43,16 +43,25 @@ func lookupDelegationTarget(domainName string) (string, error) {
 }
 
 func loadOrCreateAcmeAccount(userID uint, email string) (*acmeUser, error) {
-	var account models.AcmeAccount
-	err := config.DB.Where("user_id = ?", userID).First(&account).Error
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+	user, err := loadAcmeAccount(userID)
+	if err == nil {
+		return user, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err
 	}
+	return createAcmeAccount(userID, email)
+}
 
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return createAcmeAccount(userID, email)
+func loadAcmeAccount(userID uint) (*acmeUser, error) {
+	var account models.AcmeAccount
+	if err := config.DB.Where("user_id = ?", userID).First(&account).Error; err != nil {
+		return nil, err
 	}
+	return acmeUserFromAccount(account)
+}
 
+func acmeUserFromAccount(account models.AcmeAccount) (*acmeUser, error) {
 	keyPEM, err := Decrypt(account.PrivateKeyPEM)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt ACME account key: %w", err)
@@ -63,7 +72,7 @@ func loadOrCreateAcmeAccount(userID uint, email string) (*acmeUser, error) {
 	}
 
 	user := &acmeUser{
-		Email: email,
+		Email: account.Email,
 		key:   privateKey,
 	}
 
@@ -99,6 +108,9 @@ func createAcmeAccount(userID uint, email string) (*acmeUser, error) {
 		PrivateKeyPEM: encryptedKey,
 	}
 	if err := config.DB.Create(&account).Error; err != nil {
+		if errors.Is(err, gorm.ErrDuplicatedKey) {
+			return loadAcmeAccount(userID)
+		}
 		return nil, err
 	}
 
@@ -116,6 +128,21 @@ func saveAcmeRegistration(userID uint, reg *registration.Resource) error {
 	return config.DB.Model(&models.AcmeAccount{}).
 		Where("user_id = ?", userID).
 		Update("registration", data).Error
+}
+
+func loadAcmeRegistration(userID uint) (*registration.Resource, error) {
+	var account models.AcmeAccount
+	if err := config.DB.Where("user_id = ?", userID).First(&account).Error; err != nil {
+		return nil, err
+	}
+	if len(account.Registration) == 0 {
+		return nil, nil
+	}
+	var reg registration.Resource
+	if err := json.Unmarshal(account.Registration, &reg); err != nil {
+		return nil, fmt.Errorf("parse ACME registration: %w", err)
+	}
+	return &reg, nil
 }
 
 func newLegoClient(user *acmeUser) (*lego.Client, error) {
@@ -146,12 +173,27 @@ func ensureRegistered(client *lego.Client, user *acmeUser, userID uint) error {
 	if user.Registration != nil {
 		return nil
 	}
+	if reg, err := loadAcmeRegistration(userID); err != nil {
+		return err
+	} else if reg != nil {
+		user.Registration = reg
+		return nil
+	}
+
 	reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
 	if err != nil {
+		if reg, dbErr := loadAcmeRegistration(userID); dbErr == nil && reg != nil {
+			user.Registration = reg
+			return nil
+		}
 		return fmt.Errorf("ACME registration: %w", err)
 	}
 	user.Registration = reg
 	if err := saveAcmeRegistration(userID, reg); err != nil {
+		if reg, dbErr := loadAcmeRegistration(userID); dbErr == nil && reg != nil {
+			user.Registration = reg
+			return nil
+		}
 		return fmt.Errorf("save ACME registration: %w", err)
 	}
 	slog.Info("registered new ACME account", "user_id", userID, "email", user.Email)

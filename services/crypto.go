@@ -14,7 +14,7 @@ import (
 
 var encryptionKey []byte
 
-// InitCrypto loads the encryption key from config. Empty key disables encryption (dev only).
+// InitCrypto loads the encryption key from config. Empty key is allowed only in dev mode.
 func InitCrypto() error {
 	if config.Cfg.Security.EncryptionKey == "" {
 		encryptionKey = nil

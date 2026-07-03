@@ -17,7 +17,7 @@ func CORSMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		allowed := len(allowedOrigins) == 0
+		allowed := config.Cfg.Security.IsDevMode() && len(allowedOrigins) == 0
 		for _, o := range allowedOrigins {
 			if o == origin || o == "*" {
 				allowed = true

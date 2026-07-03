@@ -22,6 +22,10 @@ func InitDB() {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 
+	if err := removeDuplicateCertificates(DB); err != nil {
+		log.Fatalf("Failed to deduplicate certificates: %v", err)
+	}
+
 	// Migrate the schema
 	err = DB.AutoMigrate(
 		&models.User{},
@@ -34,4 +38,13 @@ func InitDB() {
 	if err != nil {
 		log.Fatalf("Failed to migrate database: %v", err)
 	}
+}
+
+// removeDuplicateCertificates keeps the newest row per domain_id before adding a unique index.
+func removeDuplicateCertificates(db *gorm.DB) error {
+	return db.Exec(`
+		DELETE FROM certificates a
+		USING certificates b
+		WHERE a.domain_id = b.domain_id AND a.id < b.id
+	`).Error
 }
