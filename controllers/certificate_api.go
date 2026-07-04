@@ -1,6 +1,8 @@
 package controllers
 
 import (
+	"errors"
+	"io"
 	"net/http"
 	"strconv"
 
@@ -37,10 +39,10 @@ func issueCertificateInternal(c *gin.Context, domainID uint, forceRenew bool) {
 		return
 	}
 
-	go runCertJob(domain, *user, forceRenew)
+	StartCertJob(domain, *user, forceRenew, false)
 
 	utils.RespondSuccess(c, gin.H{
-		"status":  "pending",
+		"status":  "generating",
 		"message": "Certificate issuance started. Refresh the domain to check status.",
 	})
 }
@@ -52,7 +54,10 @@ func IssueCertificate(c *gin.Context) {
 	}
 
 	var input IssueCertInput
-	_ = c.ShouldBindJSON(&input)
+	if err := c.ShouldBindJSON(&input); err != nil && !errors.Is(err, io.EOF) {
+		utils.RespondError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	issueCertificateInternal(c, domain.ID, input.ForceRenew)
 }

@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -11,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/certificate"
@@ -18,6 +20,7 @@ import (
 	"github.com/go-acme/lego/v4/registration"
 	"github.com/hedwi/certhub-server/config"
 	"github.com/hedwi/certhub-server/models"
+	"github.com/hedwi/certhub-server/utils"
 	"gorm.io/gorm"
 )
 
@@ -31,15 +34,21 @@ func (u *acmeUser) GetEmail() string                        { return u.Email }
 func (u *acmeUser) GetRegistration() *registration.Resource { return u.Registration }
 func (u *acmeUser) GetPrivateKey() crypto.PrivateKey        { return u.key }
 
-func lookupDelegationTarget(domainName string) (string, error) {
-	var domain models.Domain
-	if err := config.DB.Where("domain = ?", domainName).First(&domain).Error; err != nil {
-		return "", err
+func delegationTargetLookup(userID uint) func(domain string) (string, error) {
+	return func(domainName string) (string, error) {
+		domainName = utils.NormalizeDomain(domainName)
+		var domain models.Domain
+		if err := config.DB.Where("domain = ? AND user_id = ?", domainName, userID).First(&domain).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return "", fmt.Errorf("domain %q not found for user", domainName)
+			}
+			return "", err
+		}
+		if domain.CNameTarget == "" {
+			return "", fmt.Errorf("domain %q has no delegation target configured", domainName)
+		}
+		return domain.CNameTarget, nil
 	}
-	if domain.CNameTarget == "" {
-		return "", fmt.Errorf("domain %q has no delegation target configured", domainName)
-	}
-	return domain.CNameTarget, nil
 }
 
 func loadOrCreateAcmeAccount(userID uint, email string) (*acmeUser, error) {
@@ -58,7 +67,54 @@ func loadAcmeAccount(userID uint) (*acmeUser, error) {
 	if err := config.DB.Where("user_id = ?", userID).First(&account).Error; err != nil {
 		return nil, err
 	}
+	if err := invalidateRegistrationIfCAChanged(&account); err != nil {
+		return nil, err
+	}
 	return acmeUserFromAccount(account)
+}
+
+func effectiveCAURL() string {
+	if config.Cfg.ACME.CAURL != "" {
+		return config.Cfg.ACME.CAURL
+	}
+	return lego.LEDirectoryProduction
+}
+
+func normalizeCAURL(url string) string {
+	return strings.TrimSuffix(strings.TrimSpace(url), "/")
+}
+
+// invalidateRegistrationIfCAChanged clears a registration when acme.ca_url no longer matches.
+func invalidateRegistrationIfCAChanged(account *models.AcmeAccount) error {
+	stored := normalizeCAURL(account.CAURL)
+	current := normalizeCAURL(effectiveCAURL())
+
+	if stored == "" {
+		if len(account.Registration) == 0 {
+			return nil
+		}
+		// Legacy account: registration predates CA URL tracking; re-register against current CA.
+		slog.Info("ACME legacy registration without CA URL, will re-register",
+			"user_id", account.UserID,
+			"current_ca", current,
+		)
+		account.Registration = nil
+		return config.DB.Model(account).Update("registration", nil).Error
+	}
+	if stored == current {
+		return nil
+	}
+	slog.Info("ACME CA URL changed, discarding stale registration",
+		"user_id", account.UserID,
+		"stored_ca", stored,
+		"current_ca", current,
+	)
+	account.Registration = nil
+	account.CAURL = ""
+	return config.DB.Model(account).Updates(map[string]interface{}{
+		"registration": nil,
+		"ca_url":       "",
+	}).Error
 }
 
 func acmeUserFromAccount(account models.AcmeAccount) (*acmeUser, error) {
@@ -127,12 +183,18 @@ func saveAcmeRegistration(userID uint, reg *registration.Resource) error {
 	}
 	return config.DB.Model(&models.AcmeAccount{}).
 		Where("user_id = ?", userID).
-		Update("registration", data).Error
+		Updates(map[string]interface{}{
+			"registration": data,
+			"ca_url":       effectiveCAURL(),
+		}).Error
 }
 
 func loadAcmeRegistration(userID uint) (*registration.Resource, error) {
 	var account models.AcmeAccount
 	if err := config.DB.Where("user_id = ?", userID).First(&account).Error; err != nil {
+		return nil, err
+	}
+	if err := invalidateRegistrationIfCAChanged(&account); err != nil {
 		return nil, err
 	}
 	if len(account.Registration) == 0 {
@@ -145,20 +207,18 @@ func loadAcmeRegistration(userID uint) (*registration.Resource, error) {
 	return &reg, nil
 }
 
-func newLegoClient(user *acmeUser) (*lego.Client, error) {
+func newLegoClient(ctx context.Context, user *acmeUser, userID uint) (*lego.Client, error) {
 	cfg := lego.NewConfig(user)
-	cfg.CADirURL = config.Cfg.ACME.CAURL
-	if cfg.CADirURL == "" {
-		cfg.CADirURL = lego.LEDirectoryProduction
-	}
+	cfg.CADirURL = effectiveCAURL()
 	cfg.Certificate.KeyType = certcrypto.RSA2048
+	cfg.HTTPClient = acmeHTTPClient(ctx, cfg.HTTPClient)
 
 	client, err := lego.NewClient(cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	provider, err := newDelegationDNSProvider(lookupDelegationTarget)
+	provider, err := newDelegationDNSProvider(ctx, delegationTargetLookup(userID))
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +229,65 @@ func newLegoClient(user *acmeUser) (*lego.Client, error) {
 	return client, nil
 }
 
-func ensureRegistered(client *lego.Client, user *acmeUser, userID uint) error {
+type acmeCertResult struct {
+	certs *certificate.Resource
+	err   error
+}
+
+// runACMEWithContext runs a blocking Lego Obtain/Renew call in a goroutine so the caller
+// can return promptly when ctx is cancelled. Obtain/Renew have no context parameter, but
+// the Lego HTTP client is bound to ctx and aborts in-flight CA requests on cancel.
+// Lego's DNS-01 propagation poll loop is not context-aware and may continue for up to
+// dns.propagation_timeout; callers must wait for the domain worker before reusing slots.
+func runACMEWithContext(ctx context.Context, run func() (*certificate.Resource, error)) (*certificate.Resource, error) {
+	if err := requireACMEActive(ctx); err != nil {
+		return nil, err
+	}
+	ch := make(chan acmeCertResult, 1)
+	go func() {
+		if err := requireACMEActive(ctx); err != nil {
+			select {
+			case ch <- acmeCertResult{err: err}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		certs, err := run()
+		select {
+		case ch <- acmeCertResult{certs: certs, err: err}:
+		case <-ctx.Done():
+		}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-ch:
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := requireACMEActive(ctx); err != nil {
+			return nil, err
+		}
+		return result.certs, result.err
+	}
+}
+
+func obtainWithContext(ctx context.Context, client *lego.Client, request certificate.ObtainRequest) (*certificate.Resource, error) {
+	return runACMEWithContext(ctx, func() (*certificate.Resource, error) {
+		return client.Certificate.Obtain(request)
+	})
+}
+
+func renewWithContext(ctx context.Context, client *lego.Client, existing certificate.Resource) (*certificate.Resource, error) {
+	return runACMEWithContext(ctx, func() (*certificate.Resource, error) {
+		return client.Certificate.Renew(existing, true, false, "")
+	})
+}
+
+func ensureRegistered(ctx context.Context, client *lego.Client, user *acmeUser, userID uint) error {
+	if err := requireACMEActive(ctx); err != nil {
+		return err
+	}
 	if user.Registration != nil {
 		return nil
 	}
@@ -201,18 +319,22 @@ func ensureRegistered(client *lego.Client, user *acmeUser, userID uint) error {
 }
 
 // ObtainCertificate issues a new certificate for domain using DNS-01 CNAME delegation.
-func ObtainCertificate(userID uint, domain string, email string) (*certificate.Resource, error) {
+func ObtainCertificate(ctx context.Context, userID uint, domain string, email string) (*certificate.Resource, error) {
+	if err := requireACMEActive(ctx); err != nil {
+		return nil, err
+	}
+
 	user, err := loadOrCreateAcmeAccount(userID, email)
 	if err != nil {
 		return nil, err
 	}
 
-	client, err := newLegoClient(user)
+	client, err := newLegoClient(ctx, user, userID)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := ensureRegistered(client, user, userID); err != nil {
+	if err := ensureRegistered(ctx, client, user, userID); err != nil {
 		return nil, err
 	}
 
@@ -221,35 +343,35 @@ func ObtainCertificate(userID uint, domain string, email string) (*certificate.R
 		Bundle:  true,
 	}
 
-	certs, err := client.Certificate.Obtain(request)
-	if err != nil {
-		return nil, err
-	}
-	return certs, nil
+	return obtainWithContext(ctx, client, request)
 }
 
 // RenewExistingCertificate renews a certificate using the stored ACME account and cert resource.
-func RenewExistingCertificate(userID uint, email string, existing *certificate.Resource) (*certificate.Resource, error) {
+func RenewExistingCertificate(ctx context.Context, userID uint, email string, existing *certificate.Resource) (*certificate.Resource, error) {
+	if err := requireACMEActive(ctx); err != nil {
+		return nil, err
+	}
+
 	user, err := loadOrCreateAcmeAccount(userID, email)
 	if err != nil {
 		return nil, err
 	}
 
-	client, err := newLegoClient(user)
+	client, err := newLegoClient(ctx, user, userID)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := ensureRegistered(client, user, userID); err != nil {
+	if err := ensureRegistered(ctx, client, user, userID); err != nil {
 		return nil, err
 	}
 
 	if existing.CertURL == "" {
 		slog.Warn("cert URL missing, falling back to full obtain", "domain", existing.Domain)
-		return ObtainCertificate(userID, existing.Domain, email)
+		return ObtainCertificate(ctx, userID, existing.Domain, email)
 	}
 
-	renewed, err := client.Certificate.Renew(*existing, true, false, "")
+	renewed, err := renewWithContext(ctx, client, *existing)
 	if err != nil {
 		return nil, fmt.Errorf("ACME renew: %w", err)
 	}

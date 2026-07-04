@@ -3,10 +3,12 @@ package controllers
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -17,6 +19,40 @@ import (
 	"github.com/hedwi/certhub-server/utils"
 	"gorm.io/gorm"
 )
+
+var certJobWG sync.WaitGroup
+
+const cancelledCertJobMessage = "certificate operation was cancelled"
+
+// StartCertJob runs a certificate operation asynchronously and tracks it for graceful shutdown.
+// The caller must have acquired a cert job slot via tryAcquireCertJobSlot; the slot is released when the job finishes.
+func StartCertJob(domain models.Domain, user models.User, renew, autoRenew bool) {
+	ctx, token, release := beginCertJob(domain.ID)
+	certJobWG.Add(1)
+	go func() {
+		workerDone := beginDomainWorker(domain.ID)
+		defer workerDone()
+		defer certJobWG.Done()
+		defer release()
+		defer releaseCertJobSlot()
+		runCertJob(ctx, domain, user, renew, autoRenew, token)
+	}()
+}
+
+// WaitCertJobs blocks until all in-flight certificate jobs finish or timeout elapses.
+func WaitCertJobs(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		certJobWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
 
 func setDomainError(domainID uint, status, message string) {
 	config.DB.Model(&models.Domain{}).Where("id = ?", domainID).Updates(map[string]interface{}{
@@ -59,36 +95,96 @@ func saveCertificateRecord(domainID uint, certRecord models.Certificate) error {
 		}
 
 		return tx.Model(&models.Domain{}).Where("id = ?", domainID).Updates(map[string]interface{}{
-			"status":           "active",
-			"error_message":    "",
-			"generating_since": nil,
+			"status":                   "active",
+			"error_message":            "",
+			"generating_since":         nil,
+			"auto_renew_failures":      0,
+			"auto_renew_backoff_until": nil,
 		}).Error
 	})
 }
 
-func runCertJob(domain models.Domain, user models.User, renew bool) {
+func domainHasCertificate(domainID uint) bool {
+	var count int64
+	config.DB.Model(&models.Certificate{}).Where("domain_id = ?", domainID).Count(&count)
+	return count > 0
+}
+
+// setDomainAutoRenewFailure keeps the domain active when a valid certificate remains
+// but records the renewal error for the UI and scheduler backoff.
+func setDomainAutoRenewFailure(domainID uint, message string) {
+	config.DB.Model(&models.Domain{}).Where("id = ?", domainID).Updates(map[string]interface{}{
+		"status":           "active",
+		"error_message":    message,
+		"generating_since": nil,
+	})
+}
+
+func failCertJob(domainID uint, message string, autoRenew bool) {
+	if autoRenew && domainHasCertificate(domainID) {
+		setDomainAutoRenewFailure(domainID, message)
+		scheduleAutoRenewBackoff(domainID)
+		return
+	}
+	setDomainError(domainID, "error", message)
+	if autoRenew {
+		scheduleAutoRenewBackoff(domainID)
+	}
+}
+
+func failCertJobIfActive(domainID uint, token uint64, message string, autoRenew bool) {
+	if !isCertJobActive(domainID, token) {
+		slog.Info("skipping cert job failure for superseded job",
+			"domain_id", domainID,
+			"message", message,
+		)
+		return
+	}
+	failCertJob(domainID, message, autoRenew)
+}
+
+func runCertJob(ctx context.Context, domain models.Domain, user models.User, renew, autoRenew bool, token uint64) {
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("certificate job panicked",
 				"domain", domain.Domain,
 				"domain_id", domain.ID,
 				"renew", renew,
+				"auto_renew", autoRenew,
 				"panic", r,
 				"stack", string(debug.Stack()),
 			)
-			setDomainError(domain.ID, "error", "internal error during certificate operation")
+			failCertJobIfActive(domain.ID, token, "internal error during certificate operation", autoRenew)
 		}
 	}()
 
+	if err := ctx.Err(); err != nil {
+		rollbackCancelledCertJob(domain.ID, token, autoRenew)
+		return
+	}
+
+	if domain.CNameTarget == "" {
+		failCertJobIfActive(domain.ID, token, "CNAME target not configured for this domain", autoRenew)
+		return
+	}
+	if err := services.VerifyChallengeCNAME(ctx, domain.Domain, domain.CNameTarget); err != nil {
+		failCertJobIfActive(domain.ID, token, err.Error(), autoRenew)
+		return
+	}
+
 	var certs *certificate.Resource
 	var err error
+
+	acmeCtx := services.WithCertJobScope(ctx, func() bool {
+		return isCertJobActive(domain.ID, token)
+	})
 
 	var existing models.Certificate
 	hasExisting := config.DB.Where("domain_id = ?", domain.ID).First(&existing).Error == nil
 
 	if renew || hasExisting {
 		if !hasExisting {
-			setDomainError(domain.ID, "error", "no existing certificate to renew")
+			failCertJobIfActive(domain.ID, token, "no existing certificate to renew", autoRenew)
 			return
 		}
 		if !renew && hasExisting {
@@ -96,17 +192,36 @@ func runCertJob(domain models.Domain, user models.User, renew bool) {
 		}
 		resource, buildErr := services.BuildCertResource(&existing)
 		if buildErr != nil {
-			setDomainError(domain.ID, "error", buildErr.Error())
+			failCertJobIfActive(domain.ID, token, buildErr.Error(), autoRenew)
 			return
 		}
-		certs, err = services.RenewExistingCertificate(user.ID, user.Email, resource)
+		certs, err = services.RenewExistingCertificate(acmeCtx, user.ID, user.Email, resource)
 	} else {
-		certs, err = services.ObtainCertificate(user.ID, domain.Domain, user.Email)
+		certs, err = services.ObtainCertificate(acmeCtx, user.ID, domain.Domain, user.Email)
 	}
 
 	if err != nil {
-		slog.Error("certificate operation failed", "domain", domain.Domain, "renew", renew, "error", err)
-		setDomainError(domain.ID, "error", err.Error())
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			slog.Info("certificate job cancelled",
+				"domain", domain.Domain,
+				"domain_id", domain.ID,
+				"renew", renew,
+				"auto_renew", autoRenew,
+			)
+			rollbackCancelledCertJob(domain.ID, token, autoRenew)
+			return
+		}
+		slog.Error("certificate operation failed", "domain", domain.Domain, "renew", renew, "auto_renew", autoRenew, "error", err)
+		failCertJobIfActive(domain.ID, token, err.Error(), autoRenew)
+		return
+	}
+
+	if err := ctx.Err(); err != nil {
+		rollbackCancelledCertJob(domain.ID, token, autoRenew)
+		return
+	}
+	if !isCertJobActive(domain.ID, token) {
+		slog.Info("skipping cert save for superseded job", "domain", domain.Domain, "domain_id", domain.ID)
 		return
 	}
 
@@ -118,7 +233,7 @@ func runCertJob(domain models.Domain, user models.User, renew bool) {
 
 	encryptedKey, err := services.Encrypt(certs.PrivateKey)
 	if err != nil {
-		setDomainError(domain.ID, "error", "failed to encrypt private key")
+		failCertJobIfActive(domain.ID, token, "failed to encrypt private key", autoRenew)
 		return
 	}
 
@@ -136,7 +251,7 @@ func runCertJob(domain models.Domain, user models.User, renew bool) {
 
 	if err := saveCertificateRecord(domain.ID, certRecord); err != nil {
 		slog.Error("failed to save certificate", "domain", domain.Domain, "error", err)
-		setDomainError(domain.ID, "error", "failed to save certificate")
+		failCertJobIfActive(domain.ID, token, "failed to save certificate", autoRenew)
 		return
 	}
 
@@ -144,9 +259,21 @@ func runCertJob(domain models.Domain, user models.User, renew bool) {
 }
 
 func beginCertOperation(c *gin.Context, domain models.Domain, userID uint, renew bool) (*models.User, bool) {
-	if err := services.VerifyChallengeCNAME(domain.Domain, domain.CNameTarget); err != nil {
+	if domain.CNameTarget == "" {
+		utils.RespondError(c, http.StatusBadRequest, "CNAME target not configured for this domain")
+		return nil, false
+	}
+
+	if err := services.VerifyChallengeCNAME(c.Request.Context(), domain.Domain, domain.CNameTarget); err != nil {
 		utils.RespondError(c, http.StatusBadRequest, err.Error())
 		return nil, false
+	}
+
+	if !renew && loadCertificate(domain.ID) == nil && domain.Status != "verified" {
+		if err := markDomainCnameVerified(domain.ID); err != nil {
+			utils.RespondError(c, http.StatusInternalServerError, "Failed to update domain status")
+			return nil, false
+		}
 	}
 
 	user, err := lockDomainForCertJob(domain, renew)
@@ -162,7 +289,28 @@ func beginCertOperation(c *gin.Context, domain models.Domain, userID uint, renew
 		utils.RespondError(c, http.StatusInternalServerError, "Failed to update domain status")
 		return nil, false
 	}
+
+	if !tryAcquireCertJobSlot() {
+		rollbackGeneratingDomain(domain.ID, "", true)
+		utils.RespondError(c, http.StatusTooManyRequests, "Too many certificate operations in progress; try again later")
+		return nil, false
+	}
 	return user, true
+}
+
+// rollbackCancelledCertJob resets a generating domain when its job was cancelled without a replacement.
+func rollbackCancelledCertJob(domainID uint, token uint64, autoRenew bool) {
+	if isCertJobActive(domainID, token) {
+		return
+	}
+	if certJobInflight(domainID) {
+		return
+	}
+	message := ""
+	if autoRenew {
+		message = cancelledCertJobMessage
+	}
+	rollbackGeneratingDomain(domainID, message, true)
 }
 
 func writeCertificateZip(c *gin.Context, domainName string, cert *models.Certificate, keyPEM []byte) {

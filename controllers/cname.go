@@ -1,18 +1,49 @@
 package controllers
 
 import (
+	"net/http"
+	"strings"
+	"time"
+
 	"github.com/gin-gonic/gin"
 	"github.com/hedwi/certhub-server/config"
+	"github.com/hedwi/certhub-server/models"
 	"github.com/hedwi/certhub-server/services"
 	"github.com/hedwi/certhub-server/utils"
 )
+
+func cnameLiveCheckEnabled(c *gin.Context) bool {
+	switch strings.ToLower(strings.TrimSpace(c.DefaultQuery("live", "true"))) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
 
 func GetCname(c *gin.Context) {
 	domain, ok := getDomainOwned(c, c.Param("id"))
 	if !ok {
 		return
 	}
-	utils.RespondSuccess(c, toCnameConfigDTO(domain))
+
+	var liveVerified *bool
+	if cnameLiveCheckEnabled(c) && domain.CNameTarget != "" {
+		err := services.VerifyChallengeCNAME(c.Request.Context(), domain.Domain, domain.CNameTarget)
+		ok := err == nil
+		liveVerified = &ok
+	}
+
+	utils.RespondSuccess(c, toCnameConfigDTO(domain, liveVerified))
+}
+
+func markDomainCnameVerified(domainID uint) error {
+	now := time.Now()
+	return config.DB.Model(&models.Domain{}).Where("id = ?", domainID).Updates(map[string]interface{}{
+		"status":            "verified",
+		"error_message":     "",
+		"cname_verified_at": now,
+	}).Error
 }
 
 func VerifyCname(c *gin.Context) {
@@ -29,7 +60,7 @@ func VerifyCname(c *gin.Context) {
 		return
 	}
 
-	if err := services.VerifyChallengeCNAME(domain.Domain, domain.CNameTarget); err != nil {
+	if err := services.VerifyChallengeCNAME(c.Request.Context(), domain.Domain, domain.CNameTarget); err != nil {
 		utils.RespondSuccess(c, gin.H{
 			"verified": false,
 			"message":  err.Error(),
@@ -37,13 +68,15 @@ func VerifyCname(c *gin.Context) {
 		return
 	}
 
-	config.DB.Model(&domain).Updates(map[string]interface{}{
-		"status":        "verified",
-		"error_message": "",
-	})
+	verifiedAt := time.Now()
+	if err := markDomainCnameVerified(domain.ID); err != nil {
+		utils.RespondError(c, http.StatusInternalServerError, "Failed to update domain status")
+		return
+	}
 
 	utils.RespondSuccess(c, gin.H{
-		"verified": true,
-		"message":  "CNAME delegation verified; you may request a certificate",
+		"verified":   true,
+		"verifiedAt": verifiedAt.UTC().Format(time.RFC3339),
+		"message":    "CNAME delegation verified; you may request a certificate",
 	})
 }

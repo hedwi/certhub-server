@@ -10,10 +10,14 @@ type Domain struct {
 	ID           uint           `gorm:"primaryKey" json:"id"`
 	UserID       uint           `gorm:"index;not null" json:"user_id"`
 	Domain       string         `gorm:"uniqueIndex;not null" json:"domain"`
-	Status          string         `gorm:"default:'pending'" json:"status"` // pending, verified, generating, active, error
-	GeneratingSince *time.Time     `json:"-"`                               // set when status becomes generating
-	CNameTarget     string         `json:"cname_target"`                    // per-domain delegation FQDN
-	ErrorMessage string         `gorm:"type:text" json:"error_message,omitempty"`
+	Status                string         `gorm:"default:'pending'" json:"status"` // pending, verified, generating, active, error
+	GeneratingSince       *time.Time     `json:"-"`                               // set when status becomes generating
+	CNameTarget           string         `gorm:"column:cname_target" json:"cname_target"` // per-domain delegation FQDN
+	AutoRenew             bool           `gorm:"not null;default:true" json:"auto_renew"`
+	CnameVerifiedAt       *time.Time     `json:"-"` // last successful POST /cname/verify
+	AutoRenewFailures     int            `json:"-"`                               // consecutive auto-renewal failures
+	AutoRenewBackoffUntil *time.Time     `json:"-"`                               // skip auto-renewal until this time
+	ErrorMessage          string         `gorm:"type:text" json:"error_message,omitempty"`
 	CreatedAt    time.Time      `json:"created_at"`
 	UpdatedAt    time.Time      `json:"updated_at"`
 	DeletedAt    gorm.DeletedAt `gorm:"index" json:"-"`
@@ -29,7 +33,7 @@ type Certificate struct {
 	Issuer        []byte    `json:"-"`
 	CertURL       string    `json:"-"`
 	CertStableURL string    `json:"-"`
-	ExpiresAt     time.Time `json:"expires_at"`
+	ExpiresAt     time.Time `gorm:"index" json:"expires_at"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }

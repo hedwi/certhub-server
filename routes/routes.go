@@ -56,17 +56,20 @@ func SetupRouter() *gin.Engine {
 		{
 			protected.GET("/profile", controllers.GetProfile)
 
+			certIssueRL := middleware.CertIssueRateLimitMiddleware()
+
 			domains := protected.Group("/domains")
 			{
 				domains.POST("", controllers.AddDomain)
 				domains.GET("", controllers.ListDomains)
 				domains.GET("/:id", controllers.GetDomain)
+				domains.PATCH("/:id", controllers.UpdateDomain)
 				domains.DELETE("/:id", controllers.DeleteDomain)
 
 				domains.GET("/:id/cname", controllers.GetCname)
 				domains.POST("/:id/cname/verify", controllers.VerifyCname)
 
-				domains.POST("/:id/certificate/issue", controllers.IssueCertificate)
+				domains.POST("/:id/certificate/issue", certIssueRL, controllers.IssueCertificate)
 				domains.GET("/:id/certificate", controllers.GetCertificateInfo)
 				domains.GET("/:id/certificate/download", controllers.DownloadDomainCertificate)
 
@@ -81,8 +84,8 @@ func SetupRouter() *gin.Engine {
 			// Legacy certificate routes for direct API clients
 			certs := protected.Group("/certificates")
 			{
-				certs.POST("/generate", controllers.GenerateCertificate)
-				certs.POST("/renew", controllers.RenewCertificate)
+				certs.POST("/generate", certIssueRL, controllers.GenerateCertificate)
+				certs.POST("/renew", certIssueRL, controllers.RenewCertificate)
 				certs.GET("", controllers.ListCertificates)
 				certs.GET("/:id/download", controllers.DownloadCertificate)
 			}

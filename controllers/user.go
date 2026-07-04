@@ -16,6 +16,11 @@ type RegisterInput struct {
 }
 
 func Register(c *gin.Context) {
+	if !config.Cfg.Auth.IsRegistrationEnabled() {
+		utils.RespondError(c, http.StatusForbidden, "User registration is disabled")
+		return
+	}
+
 	var input RegisterInput
 	if err := c.ShouldBindJSON(&input); err != nil {
 		utils.RespondError(c, http.StatusBadRequest, err.Error())

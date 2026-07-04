@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -69,7 +70,7 @@ func TestParseCertExpiry(t *testing.T) {
 }
 
 func TestVerifyChallengeCNAME_InvalidDomain(t *testing.T) {
-	err := VerifyChallengeCNAME("definitely-not-a-real-domain-xyz123.invalid", "1.cname.example.com")
+	err := VerifyChallengeCNAME(context.Background(), "definitely-not-a-real-domain-xyz123.invalid", "1.cname.example.com")
 	if err == nil {
 		t.Fatal("expected DNS lookup error")
 	}

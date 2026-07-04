@@ -43,6 +43,7 @@ func StartRenewalScheduler(ctx context.Context) {
 			"renew_before_days", config.Cfg.Renewal.RenewBeforeDays,
 			"generating_timeout", generatingTimeout,
 			"generating_check_interval", cleanupInterval,
+			"max_concurrent_cert_jobs", config.Cfg.Renewal.MaxConcurrentCertJobs(),
 		)
 	} else {
 		slog.Info("auto renewal disabled; generating cleanup active",
@@ -77,40 +78,76 @@ func runStuckGeneratingCleanup(timeout time.Duration) {
 	}
 
 	for _, domain := range stuck {
-		rollbackStuckGenerating(domain)
+		if certJobInflight(domain.ID) {
+			slog.Warn("cancelling timed-out cert job during stuck generating cleanup",
+				"domain", domain.Domain,
+				"domain_id", domain.ID,
+			)
+			cancelCertJob(domain.ID)
+			waitDomainWorker(domain.ID, config.Cfg.Renewal.GeneratingTimeoutDuration())
+		}
+		rollbackStuckGenerating(domain, false)
 	}
 }
 
-func rollbackStuckGenerating(domain models.Domain) {
-	var cert models.Certificate
-	hasCert := config.DB.Where("domain_id = ?", domain.ID).First(&cert).Error == nil
-
-	updates := map[string]interface{}{
-		"generating_since": nil,
+func rollbackStuckGenerating(domain models.Domain, force bool) {
+	if !force && certJobInflight(domain.ID) {
+		return
 	}
+
+	hasCert := domainHasCertificate(domain.ID)
+	message := ""
+	if !hasCert {
+		message = stuckGeneratingMessage
+	}
+	rollbackGeneratingDomain(domain.ID, message, true)
+
 	if hasCert {
-		updates["status"] = "active"
-		updates["error_message"] = ""
 		slog.Warn("reset stuck generating domain to active",
 			"domain", domain.Domain,
 			"domain_id", domain.ID,
 		)
 	} else {
-		updates["status"] = "error"
-		updates["error_message"] = stuckGeneratingMessage
 		slog.Warn("reset stuck generating domain to error",
 			"domain", domain.Domain,
 			"domain_id", domain.ID,
 		)
 	}
+}
 
-	if err := config.DB.Model(&models.Domain{}).Where("id = ?", domain.ID).Updates(updates).Error; err != nil {
-		slog.Error("failed to reset stuck generating domain",
-			"domain", domain.Domain,
-			"domain_id", domain.ID,
-			"error", err,
-		)
+// rollbackGeneratingDomain clears generating state after a cancelled or failed lock.
+// When restoreVerified is true and the domain had CNAME verified, status returns to verified instead of error.
+func rollbackGeneratingDomain(domainID uint, errorMessage string, restoreVerified bool) {
+	var domain models.Domain
+	if err := config.DB.First(&domain, domainID).Error; err != nil || domain.Status != "generating" {
+		return
 	}
+
+	hasCert := domainHasCertificate(domainID)
+	updates := map[string]interface{}{
+		"generating_since": nil,
+	}
+
+	switch {
+	case hasCert:
+		updates["status"] = "active"
+		if errorMessage != "" {
+			updates["error_message"] = errorMessage
+		} else {
+			updates["error_message"] = ""
+		}
+	case restoreVerified && domain.CnameVerifiedAt != nil:
+		updates["status"] = "verified"
+		updates["error_message"] = ""
+	default:
+		updates["status"] = "error"
+		if errorMessage == "" {
+			errorMessage = cancelledCertJobMessage
+		}
+		updates["error_message"] = errorMessage
+	}
+
+	config.DB.Model(&models.Domain{}).Where("id = ?", domainID).Updates(updates)
 }
 
 func runRenewalScan() {
@@ -150,12 +187,26 @@ func tryAutoRenewDomain(domain models.Domain) {
 		return
 	}
 
+	if !domain.AutoRenew {
+		return
+	}
+
+	if domain.AutoRenewBackoffUntil != nil && time.Now().Before(*domain.AutoRenewBackoffUntil) {
+		slog.Debug("auto renewal skipped: in backoff",
+			"domain", domain.Domain,
+			"domain_id", domain.ID,
+			"until", domain.AutoRenewBackoffUntil.UTC().Format(time.RFC3339),
+			"failures", domain.AutoRenewFailures,
+		)
+		return
+	}
+
 	if domain.CNameTarget == "" {
 		slog.Warn("auto renewal skipped: cname target not configured", "domain", domain.Domain, "domain_id", domain.ID)
 		return
 	}
 
-	if err := services.VerifyChallengeCNAME(domain.Domain, domain.CNameTarget); err != nil {
+	if err := services.VerifyChallengeCNAME(context.Background(), domain.Domain, domain.CNameTarget); err != nil {
 		slog.Warn("auto renewal skipped: cname verify failed",
 			"domain", domain.Domain,
 			"domain_id", domain.ID,
@@ -174,12 +225,62 @@ func tryAutoRenewDomain(domain models.Domain) {
 		return
 	}
 
+	if !tryAcquireCertJobSlot() {
+		rollbackGeneratingDomain(domain.ID, "", true)
+		slog.Debug("auto renewal skipped: concurrency limit reached",
+			"domain", domain.Domain,
+			"domain_id", domain.ID,
+			"limit", config.Cfg.Renewal.MaxConcurrentCertJobs(),
+		)
+		return
+	}
+
 	slog.Info("auto renewal started", "domain", domain.Domain, "domain_id", domain.ID)
-	go runCertJob(domain, *user, true)
+	StartCertJob(domain, *user, true, true)
+}
+
+// RollbackAllGeneratingDomains resets every domain stuck in generating (used on shutdown).
+func RollbackAllGeneratingDomains() {
+	var domains []models.Domain
+	if err := config.DB.Where("status = ?", "generating").Find(&domains).Error; err != nil {
+		slog.Error("shutdown rollback: list generating domains failed", "error", err)
+		return
+	}
+	for _, domain := range domains {
+		rollbackStuckGenerating(domain, true)
+	}
+}
+
+func scheduleAutoRenewBackoff(domainID uint) {
+	var domain models.Domain
+	if err := config.DB.First(&domain, domainID).Error; err != nil {
+		slog.Warn("auto renew backoff: domain lookup failed", "domain_id", domainID, "error", err)
+		return
+	}
+
+	failures := domain.AutoRenewFailures + 1
+	backoff := config.Cfg.Renewal.AutoRenewBackoffDuration(failures)
+	until := time.Now().Add(backoff)
+
+	if err := config.DB.Model(&models.Domain{}).Where("id = ?", domainID).Updates(map[string]interface{}{
+		"auto_renew_failures":      failures,
+		"auto_renew_backoff_until": until,
+	}).Error; err != nil {
+		slog.Warn("auto renew backoff: update failed", "domain_id", domainID, "error", err)
+		return
+	}
+
+	slog.Info("auto renew backoff scheduled",
+		"domain", domain.Domain,
+		"domain_id", domainID,
+		"failures", failures,
+		"backoff", backoff,
+		"until", until.UTC().Format(time.RFC3339),
+	)
 }
 
 // lockDomainForCertJob sets domain status to generating and loads the owning user.
-// Stale generating locks (older than generating_timeout) may be taken over immediately.
+// Stale generating locks (older than generating_timeout) may be taken over after cancelling the prior job.
 func lockDomainForCertJob(domain models.Domain, requireExistingCert bool) (*models.User, error) {
 	if requireExistingCert {
 		var existing models.Certificate
@@ -188,14 +289,35 @@ func lockDomainForCertJob(domain models.Domain, requireExistingCert bool) (*mode
 		}
 	}
 
+	var current models.Domain
+	if err := config.DB.First(&current, domain.ID).Error; err != nil {
+		return nil, err
+	}
+
 	now := time.Now()
 	staleBefore := now.Add(-config.Cfg.Renewal.GeneratingTimeoutDuration())
+	isStaleGenerating := current.Status == "generating" &&
+		(current.GeneratingSince == nil || current.GeneratingSince.Before(staleBefore))
+
+	if certJobInflight(current.ID) {
+		if !isStaleGenerating {
+			return nil, errCertOperationInProgress
+		}
+		slog.Warn("cancelling stale in-flight cert job before lock takeover",
+			"domain", current.Domain,
+			"domain_id", current.ID,
+		)
+		cancelCertJob(current.ID)
+		if !waitDomainWorker(current.ID, config.Cfg.Renewal.GeneratingTimeoutDuration()) {
+			return nil, errCertOperationInProgress
+		}
+	}
 
 	result := config.DB.Model(&models.Domain{}).
 		Where(`id = ? AND (
 			status NOT IN ? OR
 			(status = ? AND (generating_since IS NULL OR generating_since < ?))
-		)`, domain.ID, []string{"generating"}, "generating", staleBefore).
+		)`, current.ID, []string{"generating"}, "generating", staleBefore).
 		Updates(map[string]interface{}{
 			"status":           "generating",
 			"error_message":    "",
@@ -209,8 +331,8 @@ func lockDomainForCertJob(domain models.Domain, requireExistingCert bool) (*mode
 	}
 
 	var user models.User
-	if err := config.DB.First(&user, domain.UserID).Error; err != nil {
-		setDomainError(domain.ID, "error", "user not found")
+	if err := config.DB.First(&user, current.UserID).Error; err != nil {
+		setDomainError(current.ID, "error", "user not found")
 		return nil, err
 	}
 	return &user, nil

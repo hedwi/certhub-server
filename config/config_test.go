@@ -14,6 +14,48 @@ func TestDelegationTarget(t *testing.T) {
 	}
 }
 
+func TestUnclaimedErrorReleaseDuration(t *testing.T) {
+	Cfg.Domain.UnclaimedErrorRelease = "48h"
+	if got := Cfg.Domain.UnclaimedErrorReleaseDuration(); got != 48*time.Hour {
+		t.Fatalf("got %v, want 48h", got)
+	}
+
+	Cfg.Domain.UnclaimedErrorRelease = ""
+	if got := Cfg.Domain.UnclaimedErrorReleaseDuration(); got != 72*time.Hour {
+		t.Fatalf("empty should default to 72h, got %v", got)
+	}
+}
+
+func TestRegistrationDisabledByDefault(t *testing.T) {
+	var auth AuthConfig
+	if auth.IsRegistrationEnabled() {
+		t.Fatal("registration should be disabled by default")
+	}
+
+	enabled := true
+	auth.RegistrationEnabled = &enabled
+	if !auth.IsRegistrationEnabled() {
+		t.Fatal("registration should be enabled when configured true")
+	}
+}
+
+func TestDNSPropagationDuration(t *testing.T) {
+	Cfg.DNS.PropagationTimeout = "10m"
+	if got := Cfg.DNS.PropagationTimeoutDuration(); got != 10*time.Minute {
+		t.Fatalf("got %v, want 10m", got)
+	}
+
+	Cfg.DNS.PropagationTimeout = "not-a-duration"
+	if got := Cfg.DNS.PropagationTimeoutDuration(); got != 5*time.Minute {
+		t.Fatalf("invalid timeout should fall back to 5m, got %v", got)
+	}
+
+	Cfg.DNS.PropagationInterval = "5s"
+	if got := Cfg.DNS.PropagationIntervalDuration(); got != 5*time.Second {
+		t.Fatalf("got %v, want 5s", got)
+	}
+}
+
 func TestRenewalGeneratingTimeoutDuration(t *testing.T) {
 	Cfg.Renewal.GeneratingTimeout = "20m"
 	if got := Cfg.Renewal.GeneratingTimeoutDuration(); got != 20*time.Minute {
@@ -23,6 +65,60 @@ func TestRenewalGeneratingTimeoutDuration(t *testing.T) {
 	Cfg.Renewal.GeneratingTimeout = "not-a-duration"
 	if got := Cfg.Renewal.GeneratingTimeoutDuration(); got != 15*time.Minute {
 		t.Fatalf("invalid duration should fall back to 15m, got %v", got)
+	}
+}
+
+func TestMaxConcurrentCertJobs(t *testing.T) {
+	Cfg.Renewal.MaxConcurrentJobs = 3
+	if got := Cfg.Renewal.MaxConcurrentCertJobs(); got != 3 {
+		t.Fatalf("got %d, want 3", got)
+	}
+
+	Cfg.Renewal.MaxConcurrentJobs = 0
+	if got := Cfg.Renewal.MaxConcurrentCertJobs(); got != 5 {
+		t.Fatalf("zero should fall back to 5, got %d", got)
+	}
+}
+
+func TestCertIssueRequestsPerHour(t *testing.T) {
+	Cfg.RateLimit.CertIssuePerHour = 0
+	if got := Cfg.RateLimit.CertIssueRequestsPerHour(); got != 10 {
+		t.Fatalf("unset should default to 10, got %d", got)
+	}
+
+	Cfg.RateLimit.CertIssuePerHour = 5
+	if got := Cfg.RateLimit.CertIssueRequestsPerHour(); got != 5 {
+		t.Fatalf("got %d, want 5", got)
+	}
+
+	Cfg.RateLimit.CertIssuePerHour = -1
+	if got := Cfg.RateLimit.CertIssueRequestsPerHour(); got != 0 {
+		t.Fatalf("disabled should return 0, got %d", got)
+	}
+	if Cfg.RateLimit.CertIssueRateLimitEnabled() {
+		t.Fatal("expected cert issue rate limit to be disabled at -1")
+	}
+}
+
+func TestAutoRenewBackoffDuration(t *testing.T) {
+	Cfg.Renewal.RenewBackoffBase = "6h"
+	Cfg.Renewal.RenewBackoffMax = "72h"
+
+	cases := []struct {
+		failures int
+		want     time.Duration
+	}{
+		{1, 6 * time.Hour},
+		{2, 12 * time.Hour},
+		{3, 24 * time.Hour},
+		{4, 48 * time.Hour},
+		{5, 72 * time.Hour},
+		{10, 72 * time.Hour},
+	}
+	for _, tc := range cases {
+		if got := Cfg.Renewal.AutoRenewBackoffDuration(tc.failures); got != tc.want {
+			t.Fatalf("failures=%d: got %v, want %v", tc.failures, got, tc.want)
+		}
 	}
 }
 

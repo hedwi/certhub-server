@@ -9,6 +9,7 @@ type AcmeAccount struct {
 	Email         string    `gorm:"not null" json:"email"`
 	PrivateKeyPEM []byte    `json:"-"`
 	Registration  []byte    `json:"-"` // JSON-encoded registration.Resource
+	CAURL         string    `json:"-"` // ACME directory URL this registration belongs to
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }

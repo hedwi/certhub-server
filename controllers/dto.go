@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/hedwi/certhub-server/models"
-	"github.com/hedwi/certhub-server/services"
 )
 
 type DomainDTO struct {
@@ -18,6 +17,8 @@ type DomainDTO struct {
 	Status        string  `json:"status"`
 	CertStatus    string  `json:"certStatus"`
 	CertExpiresAt *string `json:"certExpiresAt,omitempty"`
+	AutoRenew     bool    `json:"autoRenew"`
+	RenewError    *string `json:"renewError,omitempty"`
 	CreatedAt     string  `json:"createdAt"`
 }
 
@@ -34,6 +35,8 @@ type CnameConfigDTO struct {
 	Instructions string           `json:"instructions,omitempty"`
 	Note         string           `json:"note,omitempty"`
 	Verified     bool             `json:"verified,omitempty"`
+	VerifiedAt   *string          `json:"verifiedAt,omitempty"`
+	LiveChecked  bool             `json:"liveChecked"`
 }
 
 type CertificateInfoDTO struct {
@@ -95,6 +98,10 @@ func mapDomainStatus(status string) string {
 		return "active"
 	case "error":
 		return "failed"
+	case "generating":
+		return "generating"
+	case "verified":
+		return "verified"
 	default:
 		return "pending"
 	}
@@ -105,7 +112,7 @@ func mapCertStatus(domain models.Domain, cert *models.Certificate) string {
 	case "error":
 		return "failed"
 	case "generating":
-		return "pending"
+		return "generating"
 	}
 	if cert == nil {
 		return "none"
@@ -125,19 +132,42 @@ func toDomainDTO(domain models.Domain, cert *models.Certificate) DomainDTO {
 		Name:       domain.Domain,
 		Status:     mapDomainStatus(domain.Status),
 		CertStatus: mapCertStatus(domain, cert),
+		AutoRenew:  domain.AutoRenew,
 		CreatedAt:  formatTime(domain.CreatedAt),
 	}
 	if cert != nil && !cert.ExpiresAt.IsZero() {
 		exp := formatTime(cert.ExpiresAt)
 		dto.CertExpiresAt = &exp
 	}
+	if domain.ErrorMessage != "" && domain.Status == "active" {
+		msg := domain.ErrorMessage
+		dto.RenewError = &msg
+	}
 	return dto
 }
 
-func toCnameConfigDTO(domain models.Domain) CnameConfigDTO {
+func isCnameVerifiedStatus(status string) bool {
+	switch status {
+	case "verified", "active", "generating":
+		return true
+	default:
+		return false
+	}
+}
+
+func toCnameConfigDTO(domain models.Domain, liveVerified *bool) CnameConfigDTO {
 	cnameHost := "_acme-challenge." + domain.Domain
-	verified := domain.CNameTarget != "" &&
-		services.VerifyChallengeCNAME(domain.Domain, domain.CNameTarget) == nil
+
+	verified := false
+	liveChecked := false
+	switch {
+	case liveVerified != nil:
+		verified = *liveVerified
+		liveChecked = true
+	case domain.CNameTarget != "":
+		verified = isCnameVerifiedStatus(domain.Status)
+	}
+
 	return CnameConfigDTO{
 		DomainID: strconv.FormatUint(uint64(domain.ID), 10),
 		Records: []CnameRecordDTO{{
@@ -149,6 +179,8 @@ func toCnameConfigDTO(domain models.Domain) CnameConfigDTO {
 		Instructions: fmt.Sprintf("Add a CNAME record at your DNS host: %s → %s", cnameHost, domain.CNameTarget),
 		Note: "CNAME delegation: add the record above at any DNS provider. ACME challenge TXT records are published automatically on the delegation target; no DNS API credentials are required from you.",
 		Verified:     verified,
+		VerifiedAt:   formatTimePtr(domain.CnameVerifiedAt),
+		LiveChecked:  liveChecked,
 	}
 }
 

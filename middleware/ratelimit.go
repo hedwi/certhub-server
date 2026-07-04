@@ -20,27 +20,33 @@ type limiterEntry struct {
 	lastSeen time.Time
 }
 
-type ipRateLimiter struct {
+type keyedRateLimiter struct {
 	entries map[string]*limiterEntry
 	mu      sync.Mutex
 	r       rate.Limit
 	burst   int
 }
 
-func newIPRateLimiter(requestsPerMinute int) *ipRateLimiter {
-	if requestsPerMinute <= 0 {
-		requestsPerMinute = 60
+func newKeyedRateLimiter(requests int, window time.Duration, burst int) *keyedRateLimiter {
+	if requests <= 0 {
+		requests = 1
 	}
-	l := &ipRateLimiter{
+	if burst <= 0 {
+		burst = requests
+	}
+	if burst > requests {
+		burst = requests
+	}
+	l := &keyedRateLimiter{
 		entries: make(map[string]*limiterEntry),
-		r:       rate.Every(time.Minute / time.Duration(requestsPerMinute)),
-		burst:   requestsPerMinute,
+		r:       rate.Every(window / time.Duration(requests)),
+		burst:   burst,
 	}
 	go l.runCleanup()
 	return l
 }
 
-func (l *ipRateLimiter) runCleanup() {
+func (l *keyedRateLimiter) runCleanup() {
 	ticker := time.NewTicker(limiterCleanupInterval)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -48,27 +54,27 @@ func (l *ipRateLimiter) runCleanup() {
 	}
 }
 
-func (l *ipRateLimiter) evictStale(cutoff time.Time) {
+func (l *keyedRateLimiter) evictStale(cutoff time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	for ip, entry := range l.entries {
+	for key, entry := range l.entries {
 		if entry.lastSeen.Before(cutoff) {
-			delete(l.entries, ip)
+			delete(l.entries, key)
 		}
 	}
 }
 
-func (l *ipRateLimiter) allow(ip string) bool {
+func (l *keyedRateLimiter) allow(key string) bool {
 	now := time.Now()
 
 	l.mu.Lock()
-	entry, ok := l.entries[ip]
+	entry, ok := l.entries[key]
 	if !ok {
 		entry = &limiterEntry{
 			limiter:  rate.NewLimiter(l.r, l.burst),
 			lastSeen: now,
 		}
-		l.entries[ip] = entry
+		l.entries[key] = entry
 	} else {
 		entry.lastSeen = now
 	}
@@ -76,6 +82,19 @@ func (l *ipRateLimiter) allow(ip string) bool {
 	l.mu.Unlock()
 
 	return lim.Allow()
+}
+
+type ipRateLimiter struct {
+	*keyedRateLimiter
+}
+
+func newIPRateLimiter(requestsPerMinute int) *ipRateLimiter {
+	if requestsPerMinute <= 0 {
+		requestsPerMinute = 60
+	}
+	return &ipRateLimiter{
+		keyedRateLimiter: newKeyedRateLimiter(requestsPerMinute, time.Minute, requestsPerMinute),
+	}
 }
 
 // RateLimitMiddleware limits requests per IP when enabled in config.

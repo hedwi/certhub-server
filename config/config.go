@@ -27,15 +27,32 @@ type Config struct {
 	RateLimit RateLimitConfig `toml:"ratelimit"`
 	Renewal   RenewalConfig   `toml:"renewal"`
 	Deploy    DeployConfig    `toml:"deploy"`
+	Auth      AuthConfig      `toml:"auth"`
+}
+
+// AuthConfig controls authentication endpoints.
+type AuthConfig struct {
+	RegistrationEnabled *bool `toml:"registration_enabled"`
+}
+
+// IsRegistrationEnabled reports whether POST /api/auth/register is allowed (default false).
+func (a AuthConfig) IsRegistrationEnabled() bool {
+	if a.RegistrationEnabled == nil {
+		return false
+	}
+	return *a.RegistrationEnabled
 }
 
 // RenewalConfig controls automatic certificate renewal.
 type RenewalConfig struct {
-	Enabled                *bool  `toml:"enabled"`
-	CheckInterval          string `toml:"check_interval"`           // e.g. "1h", "30m"
-	RenewBeforeDays        int    `toml:"renew_before_days"`        // renew when expiry is within this many days
-	GeneratingTimeout      string `toml:"generating_timeout"`       // e.g. "15m"; reset stuck generating domains after this
+	Enabled                 *bool  `toml:"enabled"`
+	CheckInterval           string `toml:"check_interval"`            // e.g. "1h", "30m"
+	RenewBeforeDays         int    `toml:"renew_before_days"`         // renew when expiry is within this many days
+	GeneratingTimeout       string `toml:"generating_timeout"`        // e.g. "15m"; reset stuck generating domains after this
 	GeneratingCheckInterval string `toml:"generating_check_interval"` // how often to scan for stuck generating domains
+	RenewBackoffBase        string `toml:"renew_backoff_base"`        // e.g. "6h"; initial auto-renew retry delay after failure
+	RenewBackoffMax         string `toml:"renew_backoff_max"`         // e.g. "72h"; cap for exponential backoff
+	MaxConcurrentJobs       int    `toml:"max_concurrent_cert_jobs"`  // global cap on simultaneous ACME operations
 }
 
 // IsEnabled reports whether auto-renewal is on (default true).
@@ -54,6 +71,34 @@ func (r RenewalConfig) GeneratingTimeoutDuration() time.Duration {
 // GeneratingCheckIntervalDuration returns how often stuck generating domains are scanned.
 func (r RenewalConfig) GeneratingCheckIntervalDuration() time.Duration {
 	return parseDurationDefault(r.GeneratingCheckInterval, 5*time.Minute)
+}
+
+// AutoRenewBackoffDuration returns the retry delay after consecutiveFailures auto-renewal failures.
+func (r RenewalConfig) AutoRenewBackoffDuration(consecutiveFailures int) time.Duration {
+	base := parseDurationDefault(r.RenewBackoffBase, 6*time.Hour)
+	max := parseDurationDefault(r.RenewBackoffMax, 72*time.Hour)
+	if consecutiveFailures < 1 {
+		consecutiveFailures = 1
+	}
+	backoff := base
+	for i := 1; i < consecutiveFailures; i++ {
+		if backoff >= max {
+			return max
+		}
+		backoff *= 2
+	}
+	if backoff > max {
+		return max
+	}
+	return backoff
+}
+
+// MaxConcurrentCertJobs returns the global limit on simultaneous certificate ACME jobs.
+func (r RenewalConfig) MaxConcurrentCertJobs() int {
+	if r.MaxConcurrentJobs <= 0 {
+		return 5
+	}
+	return r.MaxConcurrentJobs
 }
 
 func parseDurationDefault(value string, fallback time.Duration) time.Duration {
@@ -115,9 +160,21 @@ type ACMEConfig struct {
 
 // DNSConfig DNS 提供商配置
 type DNSConfig struct {
-	Provider   string           `toml:"provider"`
-	AuthZone   string           `toml:"auth_zone"` // Cloudflare zone for CNAME delegation (e.g. yourservice.com)
-	Cloudflare CloudflareConfig `toml:"cloudflare"`
+	Provider            string           `toml:"provider"`
+	AuthZone            string           `toml:"auth_zone"` // Cloudflare zone for CNAME delegation (e.g. yourservice.com)
+	PropagationTimeout  string           `toml:"propagation_timeout"`  // e.g. "5m"; lego DNS-01 wait for TXT propagation
+	PropagationInterval string           `toml:"propagation_interval"` // e.g. "2s"; polling interval during propagation wait
+	Cloudflare          CloudflareConfig `toml:"cloudflare"`
+}
+
+// PropagationTimeoutDuration returns how long lego waits for DNS-01 TXT propagation.
+func (d DNSConfig) PropagationTimeoutDuration() time.Duration {
+	return parseDurationDefault(d.PropagationTimeout, 5*time.Minute)
+}
+
+// PropagationIntervalDuration returns how often lego polls during DNS-01 propagation wait.
+func (d DNSConfig) PropagationIntervalDuration() time.Duration {
+	return parseDurationDefault(d.PropagationInterval, 2*time.Second)
 }
 
 // CloudflareConfig Cloudflare DNS 配置
@@ -129,7 +186,13 @@ type CloudflareConfig struct {
 
 // DomainConfig 域名相关配置
 type DomainConfig struct {
-	CNameTarget string `toml:"cname_target"` // base delegation host (e.g. cname.yourservice.com)
+	CNameTarget           string `toml:"cname_target"`            // base delegation host (e.g. cname.yourservice.com)
+	UnclaimedErrorRelease string `toml:"unclaimed_error_release"` // e.g. "72h"; release error domains without certs for claiming
+}
+
+// UnclaimedErrorReleaseDuration returns how long an error domain (no cert, CNAME was verified) must sit before others may claim it.
+func (d DomainConfig) UnclaimedErrorReleaseDuration() time.Duration {
+	return parseDurationDefault(d.UnclaimedErrorRelease, 72*time.Hour)
 }
 
 // SecurityConfig 安全配置
@@ -157,8 +220,27 @@ func (s SecurityConfig) IsDevMode() bool {
 
 // RateLimitConfig 速率限制配置
 type RateLimitConfig struct {
-	Enabled           bool `toml:"enabled"`
+	Enabled          bool `toml:"enabled"`
 	RequestsPerMinute int  `toml:"requests_per_minute"`
+	// CertIssuePerHour limits manual certificate issue/renew requests per authenticated user per hour.
+	// Default 10 when unset (0). Set to -1 to disable this limit.
+	CertIssuePerHour int `toml:"cert_issue_per_hour"`
+}
+
+// CertIssueRequestsPerHour returns the per-user hourly cap on issue/renew API calls.
+func (r RateLimitConfig) CertIssueRequestsPerHour() int {
+	if r.CertIssuePerHour < 0 {
+		return 0
+	}
+	if r.CertIssuePerHour == 0 {
+		return 10
+	}
+	return r.CertIssuePerHour
+}
+
+// CertIssueRateLimitEnabled reports whether per-user cert issue rate limiting is active.
+func (r RateLimitConfig) CertIssueRateLimitEnabled() bool {
+	return r.CertIssuePerHour != -1
 }
 
 var Cfg Config
@@ -221,20 +303,26 @@ func setDefaults() {
 			CAURL: "https://acme-v02.api.letsencrypt.org/directory",
 		},
 		DNS: DNSConfig{
-			Provider: "cloudflare",
+			Provider:            "cloudflare",
+			PropagationTimeout:  "5m",
+			PropagationInterval: "2s",
 		},
 		Domain: DomainConfig{
-			CNameTarget: "cname.yourservice.com",
+			CNameTarget:           "cname.yourservice.com",
+			UnclaimedErrorRelease: "72h",
 		},
 		RateLimit: RateLimitConfig{
-			Enabled:           true,
-			RequestsPerMinute: 60,
+			Enabled:            true,
+			RequestsPerMinute:  60,
+			CertIssuePerHour:   10,
 		},
 		Renewal: RenewalConfig{
 			CheckInterval:           "1h",
 			RenewBeforeDays:         30,
 			GeneratingTimeout:       "15m",
 			GeneratingCheckInterval: "5m",
+			RenewBackoffBase:        "6h",
+			RenewBackoffMax:         "72h",
 		},
 	}
 }
@@ -270,6 +358,12 @@ func applyDefaults() {
 	if Cfg.Domain.CNameTarget == "" {
 		Cfg.Domain.CNameTarget = "cname.yourservice.com"
 	}
+	if Cfg.DNS.PropagationTimeout == "" {
+		Cfg.DNS.PropagationTimeout = "5m"
+	}
+	if Cfg.DNS.PropagationInterval == "" {
+		Cfg.DNS.PropagationInterval = "2s"
+	}
 	if Cfg.RateLimit.RequestsPerMinute == 0 {
 		Cfg.RateLimit.RequestsPerMinute = 60
 	}
@@ -284,6 +378,12 @@ func applyDefaults() {
 	}
 	if Cfg.Renewal.GeneratingCheckInterval == "" {
 		Cfg.Renewal.GeneratingCheckInterval = "5m"
+	}
+	if Cfg.Renewal.RenewBackoffBase == "" {
+		Cfg.Renewal.RenewBackoffBase = "6h"
+	}
+	if Cfg.Renewal.RenewBackoffMax == "" {
+		Cfg.Renewal.RenewBackoffMax = "72h"
 	}
 }
 

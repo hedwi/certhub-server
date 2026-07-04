@@ -13,8 +13,11 @@ import (
 const dnsVerifyTimeout = 15 * time.Second
 
 // VerifyChallengeCNAME checks that _acme-challenge.{domain} CNAME points to the expected delegation target.
-func VerifyChallengeCNAME(domain, expectedTarget string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), dnsVerifyTimeout)
+func VerifyChallengeCNAME(ctx context.Context, domain, expectedTarget string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, dnsVerifyTimeout)
 	defer cancel()
 
 	challengeHost := "_acme-challenge." + strings.TrimSuffix(domain, ".")
